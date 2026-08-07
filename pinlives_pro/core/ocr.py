@@ -303,21 +303,82 @@ class OCRResult:
 # Engine
 # ----------------------------------------------------------------------
 
+# Recognition model, chosen by measurement on the real posts rather than by
+# recency. On single-code images: v4 Chinese rec read 4/9, v5 Chinese 6/9, and
+# the ENGLISH rec model 7/9 — the codes are Latin script, so the language of the
+# recogniser mattered more than the version. v4-en and v5-en each read a
+# different 7/9, and their union is 9/9, so an ensemble of the two is offered.
+OCR_REC_LANG = _os.environ.get('OCR_REC_LANG', 'en')          # 'en' or 'ch'
+OCR_MODEL_VERSION = _os.environ.get('OCR_MODEL_VERSION', 'PP-OCRv4')
+OCR_ENSEMBLE = _os.environ.get('OCR_ENSEMBLE', 'false').lower() == 'true'
+
+
+def _build_rapid(version: str, lang: str):
+    """A RapidOCR 3.x reader for a specific model version + recognition language."""
+    from rapidocr import RapidOCR, OCRVersion, ModelType, LangDet, LangRec
+    ver = {'PP-OCRv4': OCRVersion.PPOCRV4, 'PP-OCRv5': OCRVersion.PPOCRV5,
+           'PP-OCRv6': OCRVersion.PPOCRV6}[version]
+    rec_lang = {'en': LangRec.EN, 'ch': LangRec.CH}[lang]
+    return RapidOCR(params={
+        'Det.ocr_version': ver, 'Det.model_type': ModelType.MOBILE, 'Det.lang_type': LangDet.CH,
+        'Rec.ocr_version': ver, 'Rec.model_type': ModelType.MOBILE, 'Rec.lang_type': rec_lang,
+        'Global.use_cls': False,
+    })
+
+
 def _load_rapidocr():
-    """PP-OCRv4 via onnxruntime, if installed. Measured decisively better than
-    tesseract on these posts: it read `yNbEB7eSNa` correctly where tesseract gave
-    `yNbEBTeSNa`, ran ~80x faster (proper detection model, not a whole-image
-    scan), and handled the 20-codes-per-image layout tesseract cannot express."""
+    """Return the OCR reader(s), preferring the measured-best configuration.
+
+    RapidOCR 3.x with the English rec model is the primary; with OCR_ENSEMBLE a
+    second (v5-en) reader is added and their readings merged. Falls back to the
+    older bundled package, then to None (tesseract)."""
+    try:
+        readers = [_build_rapid(OCR_MODEL_VERSION, OCR_REC_LANG)]
+        if OCR_ENSEMBLE:
+            other = 'PP-OCRv5' if OCR_MODEL_VERSION != 'PP-OCRv5' else 'PP-OCRv4'
+            try:
+                readers.append(_build_rapid(other, OCR_REC_LANG))
+            except Exception as e:
+                logger.warning("Ensemble second model unavailable: %s", e)
+        return readers
+    except Exception as e:
+        logger.info("RapidOCR 3.x unavailable (%s); trying bundled package", e)
     try:
         from rapidocr_onnxruntime import RapidOCR
-        return RapidOCR()
-    except Exception as e:  # not installed, or model load failed
+        return [RapidOCR()]
+    except Exception as e:
         logger.info("RapidOCR unavailable, falling back to tesseract: %s", e)
         return None
 
 
+def _normalise_result(result) -> List[Tuple[str, float]]:
+    """Flatten either RapidOCR API to (text, score) pairs.
+
+    3.x returns an object with .txts/.scores; 1.4.x returns (list-of-[box,text,
+    score], elapse)."""
+    pairs: List[Tuple[str, float]] = []
+    if result is None:
+        return pairs
+    txts = getattr(result, 'txts', None)
+    if txts is not None:  # 3.x result object
+        scores = getattr(result, 'scores', None) or [0.0] * len(txts)
+        for t, s in zip(txts, scores):
+            try:
+                pairs.append((t or '', float(s) * 100))
+            except (TypeError, ValueError):
+                pairs.append((t or '', 0.0))
+        return pairs
+    if isinstance(result, (list, tuple)):  # 1.4.x (list, elapse) or bare list
+        rows = result[0] if (len(result) == 2 and isinstance(result[0], list)) else result
+        for item in rows or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                score = float(item[2]) * 100 if len(item) > 2 else 0.0
+                pairs.append((item[1] or '', score))
+    return pairs
+
+
 class GiftcodeOCR:
-    """Code OCR. Primary reader is PP-OCRv4 (RapidOCR); tesseract is the fallback."""
+    """Code OCR. Primary reader is PP-OCR (RapidOCR); tesseract is the fallback."""
 
     def __init__(self, cache_size: int = 256, max_workers: int = 5):
         self._cache: OrderedDict = OrderedDict()
@@ -327,7 +388,10 @@ class GiftcodeOCR:
 
     @property
     def backend(self) -> str:
-        return 'rapidocr-ppocrv4' if self._rapid is not None else 'tesseract'
+        if not self._rapid:
+            return 'tesseract'
+        n = len(self._rapid)
+        return f'rapidocr-{OCR_MODEL_VERSION}-{OCR_REC_LANG}' + (f'-ensemble{n}' if n > 1 else '')
 
     @staticmethod
     def _cap_resolution(img: np.ndarray) -> np.ndarray:
@@ -346,27 +410,16 @@ class GiftcodeOCR:
         (`10092JtVzWvYrF`), so substrings of a long token are offered too — the
         site validator picks the real code out of them.
         """
-        try:
-            # use_cls=False skips the horizontal/vertical classifier — these
-            # banners are horizontal, so it only adds latency.
-            result, _ = self._rapid(self._cap_resolution(img), use_cls=False)
-        except TypeError:
-            # An older RapidOCR without the per-call toggle.
-            result, _ = self._rapid(self._cap_resolution(img))
-        except Exception as e:
-            logger.warning("RapidOCR failed: %s: %s", type(e).__name__, e)
-            return []
-        if not result:
-            return []
+        img = self._cap_resolution(img)
+        pairs: List[Tuple[str, float]] = []
+        for reader in self._rapid:
+            try:
+                pairs.extend(_normalise_result(reader(img)))
+            except Exception as e:
+                logger.warning("RapidOCR reader failed: %s: %s", type(e).__name__, e)
 
         out: List[Tuple[str, float]] = []
-        for item in result:
-            text = item[1] if len(item) > 1 else ''
-            score = 0.0
-            try:
-                score = float(item[2]) * 100 if len(item) > 2 else 0.0
-            except (TypeError, ValueError):
-                score = 0.0
+        for text, score in pairs:
             for piece in (text or '').replace('\n', ' ').split():
                 tok = _NON_ALNUM.sub('', piece)
                 if tok:
@@ -464,9 +517,9 @@ class GiftcodeOCR:
             return OCRResult(cached.codes, (time.perf_counter() - start) * 1000,
                              cached.words_seen)
 
-        # Primary path: PP-OCRv4. One model does detection + recognition, so it
+        # Primary path: PP-OCR. One model does detection + recognition, so it
         # finds every code region and reads it in one fast pass.
-        if self._rapid is not None:
+        if self._rapid:
             result = self._extract_rapid(img, validator, max_codes, start)
             self._store(key, result)
             return result

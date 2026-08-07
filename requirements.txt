@@ -21,7 +21,8 @@ psutil==7.2.2
 
 # OCR: PP-OCRv4 recognition + detection via onnxruntime (primary OCR backend).
 # Tesseract stays as the fallback when this is absent.
-rapidocr-onnxruntime==1.4.4
+rapidocr==3.9.2
+rapidocr-onnxruntime==1.4.4  # legacy fallback
 onnxruntime==1.28.0
 
 # Tests

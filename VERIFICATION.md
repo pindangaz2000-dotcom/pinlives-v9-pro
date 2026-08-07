@@ -374,3 +374,39 @@ commit is left separate: it runs after the async OCR await, and holding a
 transaction across that await is the concurrency hazard this layer exists to
 avoid. That is the honest ceiling without trading the journal-first durability
 guarantee.
+
+---
+
+## Update: PP-OCR v5 vs v4 measured, and the recognition-language finding
+
+Compared on the ten real posts (exact match, no recovery layer). Single-code
+images give the clean comparison (the 20-code post confounds a single number):
+
+| model | single-code exact | note |
+|---|---|---|
+| v4, Chinese rec (previous) | 4/9 | baseline |
+| v5, Chinese rec | 6/9 | v5 does beat v4 on the same rec model |
+| v4, English rec | 7/9 | language of the recogniser matters more than the version |
+| v5, English rec | 7/9 | same count, but a *different* 7 |
+
+Two findings that only measurement gives:
+- **v5 > v4** on the Chinese rec model (6 vs 4), so the version bump is real —
+  but smaller than the language switch.
+- The codes are Latin script, so the **English rec model** is the larger lever
+  (4 → 7). "Newer" helped less than "right language".
+- v4-en and v5-en each read a different 7/9; their **union is 9/9**. They are
+  complementary, so an ensemble of the two recovers every single-code image.
+
+Integrated, with the confusion/case recovery layer on top:
+
+| engine config | single-code | latency |
+|---|---|---|
+| v4 ch-rec (before) | 6/9 | ~600 ms |
+| v4 en-rec (new default) | 8/9 | ~940 ms |
+| v4-en + v5-en ensemble | 9/9 | ~1.66 s |
+
+Default is the single English-rec model (8/9, one pass). `OCR_ENSEMBLE=true`
+adds the v5-en reader for 9/9 at double the latency — worth it where recall
+matters more than speed, and safe because OCR output is review-only and the
+site validator arbitrates the merged readings. `OCR_REC_LANG` and
+`OCR_MODEL_VERSION` select the model.
