@@ -1,0 +1,66 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# Session Files
+*.session
+*.session.tmp
+
+# Database
+*.db
+*.sqlite3
+instance/
+
+# Logs
+*.log
+logs/
+/var/log/
+
+# Cache
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# Data
+data/
+media/
+sessions/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.bak
