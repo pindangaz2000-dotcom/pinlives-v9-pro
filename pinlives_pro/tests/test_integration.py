@@ -299,6 +299,29 @@ async def test_image_only_site_skips_text_codes(authed_store):
         backend_module.persistence = None
 
 
+def test_image_only_ocr_skips_confusion_expansion(monkeypatch):
+    """An image-only site emits just the OCR reads; a normal site also offers
+    confusable-glyph variants. Prevents the 8kbet review-queue flood."""
+    from pinlives_pro.api import backend as b
+    import pinlives_pro.core.ocr as ocrmod
+
+    class _FakeOCR:
+        def extract(self, path, validator=None, max_codes=50):
+            return ocrmod.OCRResult([ocrmod.OCRCode('GItRSjD0', 1, 98.7, ['f'])], 1.0, 1)
+
+    monkeypatch.setattr(ocrmod, 'get_ocr', lambda: _FakeOCR())
+    monkeypatch.setattr(ocrmod, 'confusion_candidates', lambda code, max_swaps=1: ['GItRSjDO'])
+    # Accept any token so the only variable is the image-only gate.
+    monkeypatch.setattr(b, 'extract_codes_for_text', lambda text, site: [text])
+
+    # Image-only: no expansion -> exactly the read.
+    assert b._ocr_blocking('x', '8kbet') == [('GItRSjD0', 98.7)]
+    # Normal site: the accepted confusion variant is offered too.
+    normal = b._ocr_blocking('x', 'hi88')
+    assert ('GItRSjD0', 98.7) in normal
+    assert 'GItRSjDO' in [c for c, _ in normal]
+
+
 # ----------------------------------------------------------------------
 # Messages
 # ----------------------------------------------------------------------

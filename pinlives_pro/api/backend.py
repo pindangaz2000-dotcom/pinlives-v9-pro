@@ -551,12 +551,21 @@ def _ocr_blocking(media_path: str, site_id: Optional[str]) -> List[tuple]:
     ocr = get_ocr()
     result = ocr.extract(media_path, validator=accepts)
 
+    # For an image-only site (8KBET) the validator accepts almost any code-shaped
+    # token, so expanding each read into confusable-glyph variants floods the
+    # review queue (measured: 20 codes -> 139 candidates) without helping — there
+    # is no checksum to pick the right variant. Surface just the OCR reads; a
+    # reviewer resolves an ambiguous 0/O or l/I by eye.
+    expand = not is_image_only(site_id)
+
     out: List[tuple] = []
     seen = set()
     for candidate in result.codes:
         if candidate.code not in seen:
             seen.add(candidate.code)
             out.append((candidate.code, candidate.confidence))
+        if not expand:
+            continue
         # A near-miss the site rejects can still be the true code with one
         # confusable glyph swapped; offer those the site accepts, at lower rank.
         for alt in confusion_candidates(candidate.code, max_swaps=1):
