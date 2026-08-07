@@ -129,6 +129,49 @@ def test_add_channel_unknown_account(store):
 
 
 # ----------------------------------------------------------------------
+# Channel seed (config/channels_seed.json + seed tool)
+# ----------------------------------------------------------------------
+
+def test_channel_seed_file_is_valid():
+    from pinlives_pro.tools.seed_channels import load_seed
+    entries = load_seed()
+    # Every entry carries a site and a way to identify the channel.
+    assert len(entries) == 32
+    for e in entries:
+        assert e.get('site'), e
+        assert ('channel_id' in e) or e.get('username'), e
+    sites = {e['site'] for e in entries}
+    assert {'qq88', 'hi88', 'llwin', 'mm88', 'rr88', 'xx88',
+            'gg88', 'mb66', 'c168', 'sc88', '8kbet', 'kjc_shared'} == sites
+    # Exactly one entry is pre-resolved to a numeric id; the rest need Telegram.
+    by_id = [e for e in entries if 'channel_id' in e]
+    assert [e['channel_id'] for e in by_id] == [-1002272716520]
+
+
+@pytest.mark.asyncio
+async def test_offline_seed_adds_numeric_entries_only(authed_store):
+    """--offline stores entries that already have a numeric id and skips the
+    ones that would need a live username lookup."""
+    from pinlives_pro.tools.seed_channels import seed
+    tally = await seed(offline=True, dry_run=False)
+    assert tally.get('added') == 1
+    assert tally.get('skipped_offline') == 31
+    stored = authed_store.get_channels(PHONE)
+    assert [(c['channel_id'], c['site_id']) for c in stored] == [(-1002272716520, 'qq88')]
+
+
+@pytest.mark.asyncio
+async def test_offline_seed_is_idempotent(authed_store):
+    from pinlives_pro.tools.seed_channels import seed
+    await seed(offline=True, dry_run=False)
+    tally = await seed(offline=True, dry_run=False)
+    # Second run adds nothing new; the numeric entry is already present.
+    assert tally.get('added', 0) == 0
+    assert tally.get('already') == 1
+    assert len(authed_store.get_channels(PHONE)) == 1
+
+
+# ----------------------------------------------------------------------
 # Messages
 # ----------------------------------------------------------------------
 
