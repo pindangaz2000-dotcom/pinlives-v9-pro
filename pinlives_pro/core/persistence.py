@@ -227,6 +227,84 @@ class PersistenceManager:
             logger.error("Error journalling event: %s: %s", type(e).__name__, e)
             return None
 
+    def journal_and_store_message(self, payload: Dict[str, Any],
+                                  provenance: str = Provenance.REAL) -> tuple:
+        """Journal the event and store the message in ONE transaction.
+
+        Both are up-front inserts with no slow work between them, so a single
+        commit does the job two used to. Coalescing durable writes is the same
+        principle a batched telemetry transport applies to log delivery — here
+        it halves the fsync cost measured as the pipeline's dominant latency.
+
+        Returns (journal_id, message_id). Either can be an existing id (redelivery)
+        or None on failure.
+        """
+        phone = payload.get('phone') or ''
+        chat_id = payload.get('chat_id')
+        message_id = payload.get('message_id')
+        site_id = (payload.get('site_id') or '').lower()
+        try:
+            with self._session() as db:
+                # --- journal (idempotent) ---
+                jrow = db.query(EventJournal).filter_by(
+                    chat_id=chat_id, message_id=message_id).first()
+                if jrow is None:
+                    posted_at = None
+                    posted = payload.get('date')
+                    if posted:
+                        try:
+                            posted_at = datetime.fromisoformat(str(posted).replace('Z', '+00:00'))
+                            if posted_at.tzinfo is not None:
+                                posted_at = posted_at.replace(tzinfo=None)
+                        except ValueError:
+                            posted_at = None
+                    jrow = EventJournal(
+                        phone=phone, chat_id=chat_id, chat_name=payload.get('chat_name'),
+                        message_id=message_id, site_id=site_id, text=payload.get('text'),
+                        has_media=bool(payload.get('has_media')),
+                        media_path=payload.get('media_path'), posted_at=posted_at,
+                        provenance=provenance,
+                    )
+                    db.add(jrow)
+                    db.flush()
+
+                # --- account + channel (auto-register on first sight) ---
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    logger.error("Cannot store message, no session for %s", phone)
+                    return jrow.id, None
+                channel = db.query(MonitoredChannel).filter_by(
+                    session_id=session_row.id, channel_id=chat_id).first()
+                if channel is None:
+                    channel = MonitoredChannel(
+                        session_id=session_row.id, channel_id=chat_id,
+                        channel_name=payload.get('chat_name') or f"Chat_{chat_id}",
+                        site_id=site_id)
+                    db.add(channel)
+                    db.flush()
+
+                # --- message (idempotent on (channel, message_id)) ---
+                existing = db.query(TelegramMessage).filter_by(
+                    channel_id=channel.id, message_id=message_id).first()
+                if existing:
+                    return jrow.id, existing.id
+                mrow = TelegramMessage(
+                    session_id=session_row.id, channel_id=channel.id,
+                    message_id=message_id, text=payload.get('text'),
+                    has_media=bool(payload.get('has_media')),
+                    media_path=payload.get('media_path'))
+                db.add(mrow)
+                db.flush()
+                return jrow.id, mrow.id
+        except IntegrityError:
+            # Concurrent redelivery; fall back to the id lookups.
+            jid = self.journal_event(payload, provenance)
+            mid = self._find_message_id(phone, chat_id, message_id)
+            return jid, mid
+        except SQLAlchemyError as e:
+            logger.error("Error in journal_and_store_message: %s: %s", type(e).__name__, e)
+            return None, None
+
     def mark_journal_processed(self, journal_id: int, process_ms: float) -> bool:
         try:
             with self._session() as db:
@@ -444,6 +522,66 @@ class PersistenceManager:
             return False
         except SQLAlchemyError as e:
             logger.error("Error saving code: %s: %s", type(e).__name__, e)
+            return False
+
+    def save_codes(self, message_id: int, codes: List[Dict[str, Any]]) -> int:
+        """Insert several codes in a single transaction.
+
+        One commit for the batch instead of one per code — the write-coalescing
+        principle behind batched telemetry transports. Duplicates are skipped
+        individually without failing the batch.
+        """
+        if not codes:
+            return 0
+        # Deduplicate within the batch, then drop codes already stored — one
+        # SELECT and one INSERT instead of a try/except commit per code. A
+        # per-row rollback would abandon the whole transaction, losing the codes
+        # already added; filtering up front avoids that entirely.
+        by_hash: Dict[str, Dict[str, Any]] = {}
+        for c in codes:
+            by_hash[hashlib.sha256(c['code'].encode()).hexdigest()] = c
+        try:
+            with self._session() as db:
+                existing = {
+                    row[0] for row in db.query(ExtractedCode.code_hash)
+                    .filter(ExtractedCode.code_hash.in_(list(by_hash)))
+                    .all()
+                }
+                written = 0
+                for h, c in by_hash.items():
+                    if h in existing:
+                        continue
+                    db.add(ExtractedCode(
+                        message_id=message_id,
+                        code=c['code'],
+                        code_hash=h,
+                        is_valid=c.get('is_valid', True),
+                        entropy=c.get('entropy'),
+                        pattern_score=c.get('pattern_score'),
+                        ocr_confidence=c.get('ocr_confidence'),
+                    ))
+                    written += 1
+            return written
+        except SQLAlchemyError as e:
+            logger.error("Error bulk-saving codes: %s: %s", type(e).__name__, e)
+            return 0
+
+    def bulk_log(self, entries: List[Dict[str, Any]]) -> bool:
+        """Write many audit-log rows in one commit (the Clearcut batch pattern)."""
+        if not entries:
+            return True
+        try:
+            with self._session() as db:
+                for e in entries:
+                    db.add(SystemLog(
+                        level=e.get('level', 'INFO'),
+                        component=e.get('component', 'backend'),
+                        message=e.get('message', ''),
+                        context=e.get('context') or {},
+                    ))
+            return True
+        except SQLAlchemyError as e:
+            logger.error("Error bulk-logging: %s: %s", type(e).__name__, e)
             return False
 
     def get_codes(self, limit: int = 100, valid_only: bool = True) -> List[Dict[str, Any]]:

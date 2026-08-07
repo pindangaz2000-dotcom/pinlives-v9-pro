@@ -15,7 +15,7 @@ import time
 import json
 import psutil
 import hashlib
-from collections import OrderedDict, deque
+from collections import OrderedDict, deque, defaultdict
 from pathlib import Path
 import asyncio
 import aiohttp
@@ -207,11 +207,72 @@ def _build_identity() -> Dict[str, Any]:
 SCHEMA_VERSION = 2
 BUILD = None
 
+class AuditBatcher:
+    """Buffer INFO audit logs and flush in one write (the Clearcut batch model).
+
+    ERROR-level events flush immediately — an operator needs failures now — while
+    routine INFO lines are coalesced and shipped in bulk. Buffered INFO can be
+    lost on a hard crash; that is the same bounded-loss tradeoff Clearcut makes
+    for low-priority telemetry (its own metadata carries a LOG_LOSS counter).
+    """
+    def __init__(self, flush_size: int = 50):
+        self._buf: List[Dict[str, Any]] = []
+        self._flush_size = flush_size
+        self.dropped = 0
+
+    def add(self, level: str, component: str, message: str, context: Dict = None):
+        entry = {'level': level, 'component': component, 'message': message,
+                 'context': context or {}}
+        if level == 'ERROR':
+            # Priority path: flush the backlog and this event immediately.
+            self._buf.append(entry)
+            self.flush()
+            return
+        self._buf.append(entry)
+        if len(self._buf) >= self._flush_size:
+            self.flush()
+
+    def flush(self):
+        if not self._buf or persistence is None:
+            return
+        batch, self._buf = self._buf, []
+        if not persistence.bulk_log(batch):
+            self.dropped += len(batch)
+
+
+class StageStats:
+    """Per-stage latency accounting (the PRIMES instrumentation model).
+
+    Counts alone hide where time goes; this attributes it to journal / extract /
+    ocr / db so the slow stage is visible rather than guessed at."""
+    def __init__(self):
+        self.count: Dict[str, int] = defaultdict(int)
+        self.total_ms: Dict[str, float] = defaultdict(float)
+        self.max_ms: Dict[str, float] = defaultdict(float)
+
+    def record(self, stage: str, ms: float):
+        self.count[stage] += 1
+        self.total_ms[stage] += ms
+        self.max_ms[stage] = max(self.max_ms[stage], ms)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            stage: {
+                'count': self.count[stage],
+                'avg_ms': round(self.total_ms[stage] / self.count[stage], 2),
+                'max_ms': round(self.max_ms[stage], 2),
+            }
+            for stage in self.count
+        }
+
+
 # Global instances
 # A small pool: OCR is CPU-bound, and more threads than cores only thrash.
 _ocr_pool = _TPE(max_workers=2)
 OCR_ENABLED = os.environ.get('OCR_ENABLED', 'true').lower() == 'true'
 ocr_cache = OCRCache()
+audit = AuditBatcher()
+stage_stats = StageStats()
 message_queue = MessageQueue()
 system_monitor = SystemMonitor()
 persistence = None
@@ -280,6 +341,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    audit.flush()
     for task in _background_tasks:
         task.cancel()
     if telethon_service:
@@ -313,6 +375,9 @@ async def message_processor():
         try:
             item = await message_queue.dequeue()
             if not item:
+                # Idle: ship any buffered audit logs so they are not held
+                # indefinitely at low volume.
+                audit.flush()
                 await asyncio.sleep(0.5)
                 continue
 
@@ -384,21 +449,14 @@ async def process_message(payload: Dict) -> None:
         site_id = persistence.get_channel_site(phone, payload.get('chat_id'))
     payload = {**payload, 'site_id': site_id}
 
-    # Journal before processing: a slow or broken extractor must not lose the
-    # post, and a recorded event can be replayed to measure a new filter later.
-    journal_id = persistence.journal_event(
+    # Journal + store the message in one transaction: both are up-front inserts
+    # with no slow work between them, so a single commit replaces the two that
+    # PRIMES-style timing showed were the pipeline's dominant cost.
+    t_persist = time.perf_counter()
+    journal_id, msg_id = persistence.journal_and_store_message(
         payload, provenance=payload.get('provenance', Provenance.REAL)
     )
-
-    msg_id = persistence.save_message(
-        phone=phone,
-        chat_id=payload.get('chat_id'),
-        chat_name=payload.get('chat_name'),
-        message_id=payload.get('message_id'),
-        text=payload.get('text'),
-        has_media=payload.get('has_media', False),
-        media_path=payload.get('media_path'),
-    )
+    stage_stats.record('journal+store', (time.perf_counter() - t_persist) * 1000)
 
     # A silent None here is how messages used to disappear while the API still
     # reported success. Fail loudly so the retry path runs.
@@ -408,9 +466,17 @@ async def process_message(payload: Dict) -> None:
         )
 
     text = payload.get('text') or ''
+    t_extract = time.perf_counter()
     found = extract_codes_for_text(text, site_id)
-    for code in found:
-        persistence.save_code(msg_id, code, entropy=shannon_entropy(code))
+    stage_stats.record('extract', (time.perf_counter() - t_extract) * 1000)
+
+    # One bulk insert for the message's text codes, not a commit per code.
+    if found:
+        t_db = time.perf_counter()
+        persistence.save_codes(
+            msg_id, [{'code': c, 'entropy': shannon_entropy(c)} for c in found]
+        )
+        stage_stats.record('save_codes', (time.perf_counter() - t_db) * 1000)
 
     # Codes in an image. OCR is one wrong glyph from a wrong code, so these are
     # stored as needs-review (is_valid=False), never as confirmed alongside text
@@ -418,21 +484,30 @@ async def process_message(payload: Dict) -> None:
     media_path = payload.get('media_path')
     if media_path and OCR_ENABLED:
         try:
+            t_ocr = time.perf_counter()
             ocr_codes = await extract_codes_from_media(media_path, site_id)
-            for code, confidence in ocr_codes:
-                persistence.save_code(
-                    msg_id, code, ocr_confidence=confidence, is_valid=False,
-                )
+            stage_stats.record('ocr', (time.perf_counter() - t_ocr) * 1000)
             if ocr_codes:
+                persistence.save_codes(msg_id, [
+                    {'code': c, 'ocr_confidence': conf, 'is_valid': False}
+                    for c, conf in ocr_codes
+                ])
                 logger.info("OCR queued %d code(s) for review from %s",
                             len(ocr_codes), media_path)
         except Exception as e:
             # OCR failure must not lose the message; the text codes are stored.
             logger.error("OCR failed for %s: %s: %s", media_path, type(e).__name__, e)
 
+    # Batched audit line instead of a commit-per-message log write.
+    audit.add('INFO', 'backend', f"stored {payload.get('chat_name')}",
+              {'codes': len(found), 'site': site_id})
+
     elapsed_ms = (time.perf_counter() - started) * 1000
+    stage_stats.record('total', elapsed_ms)
     if journal_id:
+        t_mark = time.perf_counter()
         persistence.mark_journal_processed(journal_id, elapsed_ms)
+        stage_stats.record('mark_processed', (time.perf_counter() - t_mark) * 1000)
 
 
 async def extract_codes_from_media(media_path: str, site_id: Optional[str]) -> List[tuple]:
@@ -534,6 +609,8 @@ async def status() -> Dict[str, Any]:
         'status': 'running',
         'build': BUILD or {},
         'journal': journal,
+        'stage_latency_ms': stage_stats.snapshot(),
+        'audit_logs_dropped': audit.dropped,
         'uptime_seconds': system_monitor.get_uptime(),
         'messages_processed': system_monitor.message_count,
         'messages_stored': stored_messages,

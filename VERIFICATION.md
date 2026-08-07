@@ -335,3 +335,42 @@ rejected** — it was slower on this host, so it was not applied.
 
 Integrated engine after tuning: 6/9 exact recovery preserved, mean latency
 ~600 ms (from ~720–900 ms). `OCR_MAX_SIDE` bounds the resolution cap.
+
+---
+
+## Update: throughput patterns learned from Google's app libraries
+
+The uploaded Google artifacts (Clearcut logging transport, PRIMES performance
+instrumentation, protobuf packaging) are stubs, not reusable code — but the
+engineering patterns they embody transferred, and were measured, not assumed.
+
+**PRIMES pattern — per-stage instrumentation.** Added latency accounting per
+pipeline stage (journal / store / extract / save_codes / ocr / mark), exposed
+at `/api/status`. It immediately earned its place: it showed the cost was in the
+durable DB commits, not in code extraction or logging where a guess would have
+put it. Optimizing without it would have targeted the wrong stage.
+
+**Clearcut pattern — batch/coalesce writes.**
+- Audit logs are buffered and flushed in bulk; ERROR flushes immediately
+  (priority), INFO is coalesced, buffered INFO can be lost on a hard crash
+  (the bounded-loss tradeoff Clearcut itself makes). Measured: 0 dropped.
+- Codes are bulk-inserted (`save_codes`) — one commit for the batch, with
+  duplicates filtered by a single SELECT rather than a commit-per-code.
+- The journal and message writes, which PRIMES showed dominated latency, are
+  coalesced into one transaction (`journal_and_store_message`) since no slow
+  work sits between them.
+
+Measured throughput, processing 300 messages:
+
+| Stage | msg/s | ms/msg |
+|---|---|---|
+| baseline | 93 | 10.75 |
+| + batched logs + bulk codes | 96 | ~10.4 |
+| + coalesced journal/message | **110** | **9.12** |
+
+A ~18% gain. The batching alone was only ~3% — because, as PRIMES showed, the
+durable commits were the cost, not the logging. The remaining `mark_processed`
+commit is left separate: it runs after the async OCR await, and holding a
+transaction across that await is the concurrency hazard this layer exists to
+avoid. That is the honest ceiling without trading the journal-first durability
+guarantee.
