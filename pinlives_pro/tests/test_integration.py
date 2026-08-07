@@ -605,8 +605,15 @@ def test_confusion_candidates_exclude_the_input():
 
 def test_confusion_candidates_are_bounded():
     from pinlives_pro.core.ocr import confusion_candidates
-    # No confusable glyphs means nothing to try.
-    assert confusion_candidates('wxyzwxyz', max_swaps=2) == []
+    # 'admfrtny' contains no glyph in the confusion or case-ambiguous tables,
+    # so there is nothing to swap.
+    assert confusion_candidates('admfrtny', max_swaps=2) == []
+
+
+def test_case_ambiguous_letters_get_case_variants():
+    """v/V and similar are near-identical in shape; both cases are offered."""
+    from pinlives_pro.core.ocr import confusion_candidates
+    assert 'vGW65kBRMs' in confusion_candidates('VGW65kBRMs', max_swaps=1)
 
 
 def test_strikethrough_restoration_rebuilds_crossed_strokes():

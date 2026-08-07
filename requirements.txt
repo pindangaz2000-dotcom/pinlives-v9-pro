@@ -19,6 +19,11 @@ aiohttp==3.14.3
 python-dotenv==1.2.2
 psutil==7.2.2
 
+# OCR: PP-OCRv4 recognition + detection via onnxruntime (primary OCR backend).
+# Tesseract stays as the fallback when this is absent.
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.28.0
+
 # Tests
 pytest==9.1.1
 pytest-asyncio==0.24.0

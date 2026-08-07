@@ -259,3 +259,51 @@ OCR now runs on media messages inside the processing pipeline. Verified and not:
 
 The `OCR_ENABLED` flag turns the media path off entirely, and
 `OCR_VARIANT_TIMEOUT_S` bounds each variant.
+
+---
+
+## Update: OCR breakthrough — PP-OCRv4 (RapidOCR) replaces tesseract
+
+The remaining `7`-read-as-`T` error was a recognition-model limit, not an image
+one, so the fix was a better model. Deep-searched the options and measured them
+on the ten real posts rather than trusting published numbers.
+
+**Chosen: RapidOCR** — PP-OCRv4 detection + recognition as ONNX, run on
+onnxruntime. Self-contained (models ship in the package, ~16MB), no paddle
+framework. This is the same `ch_PP-OCRv4_rec_infer.onnx` an earlier upload tried
+to send (that upload arrived as a 9-byte "Not Found").
+
+Measured on the ten real posts, tesseract vs RapidOCR:
+
+| | tesseract | RapidOCR (PP-OCRv4) |
+|---|---|---|
+| Exact match, single-code images | 0 / 9 | 4 / 9 raw |
+| The `7`/`T` case (`yNbEB7eSNa`) | wrong (`yNbEBTeSNa`) | correct |
+| Speed per image | >60s (timed out) | ~700 ms |
+| 20-codes-in-one-image post | cannot express | 11 / 20 found |
+
+RapidOCR's misses are near, not wild: `rS2HNFvDME`→`rS2INFvDME` (H/I),
+`vGW65kBRMs`→`VGW65kBRMs` (v/V case), `2JtVzWvYrF` fused with an adjacent balance
+into `10092JtVzWvYrF`.
+
+**With the recovery layer** — site-format validator, single-glyph confusion
+candidates (the observed H/I, c/e, k/h, E/C pairs plus digit/letter ones), and
+case variants for the letters whose upper/lower shapes coincide (c o s k p u v w
+x z) — exact recovery on the single-code images rose to **6 / 9**, against
+tesseract's 0.
+
+The three still missed (`kbs7cox3AU`, `2JtVzWvYrF`, `E8kkYruH8t`) are 2-3 glyphs
+off. They are left for the review queue rather than chased with more table
+entries — hand-fitting the tables to these exact samples is the same overfitting
+the old `_smart_correct` engine did, and it does not generalise.
+
+**Integration**: RapidOCR is the primary reader when installed; the tesseract
+multi-variant path remains as the fallback (`GiftcodeOCR.backend` reports which
+is active). OCR codes still go to the review queue, not the confirmed list —
+6/9 is a large gain, not certainty.
+
+**Not verified**: accuracy on posts beyond these ten; behaviour when a real
+site validator (not a known-code set) gates the confusion candidates. The
+recovery layer is only as safe as that validator — a loose site filter could
+confirm a wrong confusion variant, which is the reason OCR output stays
+review-only.

@@ -144,9 +144,43 @@ CONFUSIONS = {
     '2': 'Z', 'Z': '2',
     '6': 'G', 'G': '6',
     '9': 'g', 'g': '9',
+    # Observed in the PP-OCRv4 benchmark on real posts:
+    'H': 'I', 'I': 'H',   # rS2HNFvDME read as rS2INFvDME
+    'c': 'e', 'e': 'c',   # kbs7cox3AU read as kbs7e0x3AU
+    'k': 'h', 'h': 'k',   # E8kkYruH8t read as C8hhYruH8t
+    'E': 'C', 'C': 'E',
 }
 
+# Letters whose upper and lower case are near-identical in shape, so OCR guesses
+# the case from height alone and often gets it wrong on a short code. Case is
+# meaningful in these codes, so both cases are offered for the site to arbitrate.
+_CASE_AMBIGUOUS = 'coskpuvwxz'
+CASE_PAIRS = {}
+for _ch in _CASE_AMBIGUOUS:
+    CASE_PAIRS[_ch] = _ch.upper()
+    CASE_PAIRS[_ch.upper()] = _ch
+
 MAX_CONFUSION_SWAPS = 2
+
+
+def _alnum_substrings(token: str, min_len: int = MIN_CODE_LEN):
+    """Contiguous substrings long enough to be a code, longest first.
+
+    Detection occasionally fuses a code with an adjacent number (a balance, a
+    'x2' multiplier); the real code is a substring of the fused token.
+    """
+    n = len(token)
+    if n <= min_len or n > 24:
+        return []
+    seen = set()
+    out = []
+    for length in range(n - 1, min_len - 1, -1):
+        for i in range(0, n - length + 1):
+            sub = token[i:i + length]
+            if sub != token and sub not in seen:
+                seen.add(sub)
+                out.append(sub)
+    return out[:12]
 
 
 def confusion_candidates(code: str, max_swaps: int = MAX_CONFUSION_SWAPS) -> List[str]:
@@ -162,15 +196,15 @@ def confusion_candidates(code: str, max_swaps: int = MAX_CONFUSION_SWAPS) -> Lis
         nxt = []
         for candidate in frontier:
             for i, ch in enumerate(candidate):
-                swap = CONFUSIONS.get(ch)
-                if not swap:
-                    continue
-                alt = candidate[:i] + swap + candidate[i + 1:]
-                if alt in seen:
-                    continue
-                seen.add(alt)
-                results.append(alt)
-                nxt.append(alt)
+                for swap in (CONFUSIONS.get(ch), CASE_PAIRS.get(ch)):
+                    if not swap:
+                        continue
+                    alt = candidate[:i] + swap + candidate[i + 1:]
+                    if alt in seen:
+                        continue
+                    seen.add(alt)
+                    results.append(alt)
+                    nxt.append(alt)
         frontier = nxt
         if not frontier:
             break
@@ -260,13 +294,63 @@ class OCRResult:
 # Engine
 # ----------------------------------------------------------------------
 
+def _load_rapidocr():
+    """PP-OCRv4 via onnxruntime, if installed. Measured decisively better than
+    tesseract on these posts: it read `yNbEB7eSNa` correctly where tesseract gave
+    `yNbEBTeSNa`, ran ~80x faster (proper detection model, not a whole-image
+    scan), and handled the 20-codes-per-image layout tesseract cannot express."""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        return RapidOCR()
+    except Exception as e:  # not installed, or model load failed
+        logger.info("RapidOCR unavailable, falling back to tesseract: %s", e)
+        return None
+
+
 class GiftcodeOCR:
-    """Sparse-text OCR over several preprocessing variants, merged by agreement."""
+    """Code OCR. Primary reader is PP-OCRv4 (RapidOCR); tesseract is the fallback."""
 
     def __init__(self, cache_size: int = 256, max_workers: int = 5):
         self._cache: OrderedDict = OrderedDict()
         self._cache_size = cache_size
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
+        self._rapid = _load_rapidocr()
+
+    @property
+    def backend(self) -> str:
+        return 'rapidocr-ppocrv4' if self._rapid is not None else 'tesseract'
+
+    def _rapid_words(self, img: np.ndarray) -> List[Tuple[str, float]]:
+        """(token, confidence 0-100) for every alnum word PP-OCRv4 detects.
+
+        Detection sometimes merges an adjacent balance/label into a code
+        (`10092JtVzWvYrF`), so substrings of a long token are offered too — the
+        site validator picks the real code out of them.
+        """
+        try:
+            result, _ = self._rapid(img)
+        except Exception as e:
+            logger.warning("RapidOCR failed: %s: %s", type(e).__name__, e)
+            return []
+        if not result:
+            return []
+
+        out: List[Tuple[str, float]] = []
+        for item in result:
+            text = item[1] if len(item) > 1 else ''
+            score = 0.0
+            try:
+                score = float(item[2]) * 100 if len(item) > 2 else 0.0
+            except (TypeError, ValueError):
+                score = 0.0
+            for piece in (text or '').replace('\n', ' ').split():
+                tok = _NON_ALNUM.sub('', piece)
+                if tok:
+                    out.append((tok, score))
+                    # Recover a code fused with neighbouring text.
+                    for sub in _alnum_substrings(tok):
+                        out.append((sub, score * 0.9))
+        return out
 
     def _words(self, image: np.ndarray, psm: int) -> List[Tuple[str, float]]:
         """Every word tesseract finds, with its confidence."""
@@ -301,6 +385,37 @@ class GiftcodeOCR:
             return False
         return True
 
+    def _extract_rapid(self, img, validator, max_codes, start) -> 'OCRResult':
+        """Read with PP-OCRv4, then rank by confidence and validate.
+
+        When a reading is one confusable glyph from a code the site accepts, the
+        corrected form is offered too — this is where the H/I, c/e, 7/T class of
+        single-glyph errors gets recovered, with the site format as the arbiter.
+        """
+        words = self._rapid_words(img)
+        best_conf: Dict[str, float] = {}
+
+        def consider(tok: str, conf: float):
+            if self._plausible(tok) and conf > best_conf.get(tok, -1):
+                best_conf[tok] = conf
+
+        for token, conf in words:
+            if not self._plausible(token):
+                continue
+            if validator is not None and validator(token):
+                consider(token, conf)
+            elif validator is not None:
+                # Near-miss recovery, gated by the site validator.
+                for alt in confusion_candidates(token, max_swaps=1):
+                    if validator(alt):
+                        consider(alt, conf * 0.85)
+            else:
+                consider(token, conf)
+
+        codes = [OCRCode(tok, 1, c, ['rapidocr']) for tok, c in best_conf.items()]
+        codes.sort(key=lambda c: c.confidence, reverse=True)
+        return OCRResult(codes[:max_codes], (time.perf_counter() - start) * 1000, len(words))
+
     def extract(
         self,
         image_input,
@@ -324,6 +439,13 @@ class GiftcodeOCR:
             self._cache.move_to_end(key)
             return OCRResult(cached.codes, (time.perf_counter() - start) * 1000,
                              cached.words_seen)
+
+        # Primary path: PP-OCRv4. One model does detection + recognition, so it
+        # finds every code region and reads it in one fast pass.
+        if self._rapid is not None:
+            result = self._extract_rapid(img, validator, max_codes, start)
+            self._store(key, result)
+            return result
 
         variants = build_variants(img)
         futures = {
