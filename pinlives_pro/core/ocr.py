@@ -311,6 +311,7 @@ class OCRResult:
 OCR_REC_LANG = _os.environ.get('OCR_REC_LANG', 'en')          # 'en' or 'ch'
 OCR_MODEL_VERSION = _os.environ.get('OCR_MODEL_VERSION', 'PP-OCRv4')
 OCR_ENSEMBLE = _os.environ.get('OCR_ENSEMBLE', 'false').lower() == 'true'
+OCR_RECOVERY_SWAPS = int(_os.environ.get('OCR_RECOVERY_SWAPS', '2'))
 
 
 def _build_rapid(version: str, lang: str):
@@ -482,10 +483,14 @@ class GiftcodeOCR:
             if validator is not None and validator(token):
                 consider(token, conf)
             elif validator is not None:
-                # Near-miss recovery, gated by the site validator.
-                for alt in confusion_candidates(token, max_swaps=1):
+                # Near-miss recovery, gated by the site validator. Two swaps,
+                # because a single reading can carry two independent glyph errors
+                # at once — measured: `rS2INFVDME` needs both I→H and V→v to
+                # reach `rS2HNFvDME`. The validator makes the wider search safe.
+                for alt in confusion_candidates(token, max_swaps=OCR_RECOVERY_SWAPS):
                     if validator(alt):
-                        consider(alt, conf * 0.85)
+                        consider(alt, conf * 0.8)
+                        break  # nearest-first; take the closest accepted reading
             else:
                 consider(token, conf)
 

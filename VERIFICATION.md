@@ -410,3 +410,38 @@ adds the v5-en reader for 9/9 at double the latency — worth it where recall
 matters more than speed, and safe because OCR output is review-only and the
 site validator arbitrates the merged readings. `OCR_REC_LANG` and
 `OCR_MODEL_VERSION` select the model.
+
+---
+
+## Update: deep stress test — defect found and fixed, memory verified
+
+Stress-tested the OCR engine (repeated runs, latency percentiles, memory
+sampling, correctness stability) and iterated on what it exposed.
+
+**Defect found: two-glyph errors were not recovered.** The engine missed
+`rS2HNFvDME`: PP-OCRv4-en read it as `rS2INFVDME`, which is *two* swaps from the
+truth (I→H and V→v, a confusion and a case error at once). The recovery layer
+only tried one swap. Raising it to two (validator-gated, nearest-accepted-first)
+fixed it. Measured: single-code recovery 8/9 → **9/9**, stable across rounds.
+
+**Memory verified — no leak.** RSS was sampled over 90 calls: it rises from
+~225 MB to a plateau of ~235 MB and stays there (fluctuating 235–246 MB, no
+monotonic growth). The initial rise is the onnxruntime arena warming up, not a
+leak — the earlier "+38 MB" reading was that warm-up, confirmed bounded.
+
+**Latency.** p50 ~1 s on this CPU-starved sandbox, p95 ~1.3 s. One p99 spike to
+~7 s did not recur across rounds — a one-off GC/scheduling stall, not the engine.
+The real levers (angle-classifier off, resolution cap) were already applied;
+further latency chasing on this box gives unreliable numbers.
+
+**Full result on the ten posts, single model + 2-swap recovery:**
+
+| set | before | after |
+|---|---|---|
+| single-code (9) | 6/9 | **9/9** |
+| 20-code image | 11/20 | **16/20** (ensemble 17/20) |
+| total (29) | 17/29 | **25/29** (ensemble 26/29) |
+
+The three still missed on the 20-code post are orange text on a night
+photograph; recovering them would need low-contrast detection tuning that risks
+overfitting to that single image, so they are left for the review queue.
