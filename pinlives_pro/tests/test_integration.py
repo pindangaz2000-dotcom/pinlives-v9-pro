@@ -1,308 +1,404 @@
 """
-PINLIVES Pro v3.1 - Integration Tests
-End-to-end testing of all components
+PINLIVES Pro v3.1 - Integration tests.
+
+Each test runs against a real SQLite database in a temporary directory, and the
+API tests drive the real FastAPI app through its ASGI transport. Nothing here is
+mocked away, so a passing run means the code paths actually executed.
 """
 
-import pytest
 import asyncio
-from datetime import datetime
+import os
 import sys
-sys.path.insert(0, '/workspace/pinlives-v9-pro')
+from pathlib import Path
 
-from pinlives_pro.models.database import (
-    init_db, SessionLocal, TelegramSession, TelegramMessage,
-    ExtractedCode, MonitoredChannel
+import pytest
+
+# Point the app at a throwaway database before anything imports the models.
+_TEST_DB = Path(os.environ.setdefault('DB_PATH', '/tmp/pinlives_test.db'))
+os.environ.setdefault('TELETHON_API_ID', '1111111')
+os.environ.setdefault('TELETHON_API_HASH', 'test_hash')
+os.environ.setdefault('TELETHON_PHONE', '+84388588488')
+os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123456:TEST')
+os.environ.setdefault('TELEGRAM_ADMIN_ID', '7478077662')
+os.environ.setdefault('LOG_FILE', '/tmp/pinlives_test.log')
+
+from pinlives_pro.core.codefilter import (  # noqa: E402
+    extract_codes, is_valid_code, repeat_ratio, shannon_entropy,
 )
-from pinlives_pro.core.persistence import PersistenceManager
-from pinlives_pro.core.config import Settings
+from pinlives_pro.core.config import ConfigError, Settings  # noqa: E402
+from pinlives_pro.core.persistence import PersistenceManager  # noqa: E402
+from pinlives_pro.models.database import Base, engine, init_db  # noqa: E402
 
-@pytest.fixture
-def db():
-    """Initialize test database"""
+PHONE = '+84388588488'
+# A real-shaped supergroup id: negative and beyond 32-bit range.
+CHANNEL = -1001234567890
+
+
+@pytest.fixture(autouse=True)
+def clean_db():
+    """Give every test an empty schema."""
+    Base.metadata.drop_all(bind=engine)
     init_db()
-    return SessionLocal()
+    yield
+    Base.metadata.drop_all(bind=engine)
+
 
 @pytest.fixture
-def persistence():
-    """Initialize persistence manager"""
+def store():
     return PersistenceManager()
 
-# ============================================================================
-# DATABASE TESTS
-# ============================================================================
 
-def test_database_initialization(db):
-    """Test database schema creation"""
-    assert db is not None
-    # Verify tables exist
+@pytest.fixture
+def authed_store(store):
+    store.save_session(PHONE, 'STRING_SESSION')
+    store.mark_authenticated(PHONE)
+    return store
+
+
+# ----------------------------------------------------------------------
+# Schema
+# ----------------------------------------------------------------------
+
+def test_schema_creates_every_table():
     from sqlalchemy import inspect
-    inspector = inspect(db.get_bind())
-    tables = inspector.get_table_names()
-    assert 'telegram_sessions' in tables
-    assert 'monitored_channels' in tables
-    assert 'telegram_messages' in tables
-    assert 'extracted_codes' in tables
+    tables = set(inspect(engine).get_table_names())
+    assert {
+        'telegram_sessions', 'monitored_channels', 'telegram_messages',
+        'extracted_codes', 'system_metrics', 'system_logs',
+    } <= tables
 
-def test_save_and_load_session(persistence):
-    """Test session persistence"""
-    phone = "+84388588488"
-    session_string = "test_session_string_123"
 
-    # Save
-    result = persistence.save_session(phone, session_string)
-    assert result is True
+def test_index_names_are_unique_across_tables():
+    from sqlalchemy import inspect
+    inspector = inspect(engine)
+    names = []
+    for table in inspector.get_table_names():
+        names.extend(i['name'] for i in inspector.get_indexes(table))
+    assert len(names) == len(set(names)), f"duplicate index names: {names}"
 
-    # Load
-    loaded = persistence.load_session(phone)
-    assert loaded == session_string
 
-def test_mark_authenticated(persistence):
-    """Test marking session as authenticated"""
-    phone = "+84388588488"
-    session_string = "test_session"
+# ----------------------------------------------------------------------
+# Sessions
+# ----------------------------------------------------------------------
 
-    persistence.save_session(phone, session_string)
-    result = persistence.mark_authenticated(phone)
-    assert result is True
+def test_session_round_trip(store):
+    assert store.save_session(PHONE, 'ABC') is True
+    assert store.load_session(PHONE) == 'ABC'
 
-def test_add_channel(persistence):
-    """Test adding channel to monitoring"""
-    phone = "+84388588488"
-    session_string = "test_session"
 
-    persistence.save_session(phone, session_string)
-    result = persistence.add_channel(phone, 123456789, "Test Channel")
-    assert result is True
+def test_session_update_replaces_value(store):
+    store.save_session(PHONE, 'ABC')
+    store.save_session(PHONE, 'XYZ')
+    assert store.load_session(PHONE) == 'XYZ'
 
-    # Verify we can't add duplicate
-    result = persistence.add_channel(phone, 123456789, "Test Channel")
-    assert result is False
 
-def test_save_message(persistence):
-    """Test saving message to database"""
-    phone = "+84388588488"
-    session_string = "test_session"
+def test_load_missing_session_returns_none(store):
+    assert store.load_session('+99900000000') is None
 
-    persistence.save_session(phone, session_string)
-    persistence.add_channel(phone, 123456789, "Test Channel")
 
-    msg_id = persistence.save_message(
-        phone=phone,
-        chat_id=123456789,
-        chat_name="Test Channel",
-        message_id=1,
-        text="Test message",
-        has_media=False
-    )
-    assert msg_id is not None
+def test_authentication_flag(store):
+    store.save_session(PHONE, 'ABC')
+    assert store.is_authenticated(PHONE) is False
+    assert store.mark_authenticated(PHONE) is True
+    assert store.is_authenticated(PHONE) is True
 
-def test_save_code(persistence):
-    """Test saving extracted code"""
-    phone = "+84388588488"
-    session_string = "test_session"
 
-    persistence.save_session(phone, session_string)
-    persistence.add_channel(phone, 123456789, "Test Channel")
+def test_mark_authenticated_without_session(store):
+    assert store.mark_authenticated('+99900000000') is False
 
-    msg_id = persistence.save_message(
-        phone=phone,
-        chat_id=123456789,
-        chat_name="Test Channel",
-        message_id=1,
-        text="Code: ABC123DEF456",
-        has_media=False
-    )
 
-    result = persistence.save_code(
-        message_id=msg_id,
-        code="ABC123DEF456",
-        entropy=2.5,
-        pattern_score=0.8,
-        ocr_confidence=0.95
-    )
-    assert result is True
+# ----------------------------------------------------------------------
+# Channels
+# ----------------------------------------------------------------------
 
-def test_get_codes(persistence):
-    """Test retrieving extracted codes"""
-    phone = "+84388588488"
-    session_string = "test_session"
+def test_add_channel_accepts_large_negative_id(authed_store):
+    assert authed_store.add_channel(PHONE, CHANNEL, 'Kenh Kin') is True
+    channels = authed_store.get_channels(PHONE)
+    assert len(channels) == 1
+    # The id must survive the round trip; a 32-bit column would truncate it.
+    assert channels[0]['channel_id'] == CHANNEL
 
-    persistence.save_session(phone, session_string)
-    persistence.add_channel(phone, 123456789, "Test Channel")
 
-    msg_id = persistence.save_message(
-        phone=phone,
-        chat_id=123456789,
-        chat_name="Test Channel",
-        message_id=1,
-        text="Code: ABC123",
-        has_media=False
-    )
+def test_duplicate_channel_rejected(authed_store):
+    authed_store.add_channel(PHONE, CHANNEL, 'Kenh Kin')
+    assert authed_store.add_channel(PHONE, CHANNEL, 'Kenh Kin') is False
 
-    persistence.save_code(msg_id, "ABC123")
 
-    codes = persistence.get_codes(limit=10)
-    assert len(codes) > 0
-    assert codes[0]['code'] == "ABC123"
+def test_add_channel_unknown_account(store):
+    assert store.add_channel('+99900000000', CHANNEL, 'X') is False
 
-# ============================================================================
-# METRICS & LOGGING TESTS
-# ============================================================================
 
-def test_log_metric(persistence):
-    """Test logging system metrics"""
-    result = persistence.log_metric("test_metric", 42.5, {"tag": "value"})
-    assert result is True
+# ----------------------------------------------------------------------
+# Messages
+# ----------------------------------------------------------------------
 
-def test_log_event(persistence):
-    """Test logging system events"""
-    result = persistence.log_event(
-        level="INFO",
-        component="backend",
-        message="Test event",
-        context={"details": "test"}
-    )
-    assert result is True
+def test_message_auto_registers_unseen_channel(authed_store):
+    """The listener sees chats before anyone registers them."""
+    row_id = authed_store.save_message(PHONE, CHANNEL, 'Kenh Kin', 1, 'hello')
+    assert isinstance(row_id, int)
+    assert len(authed_store.get_channels(PHONE)) == 1
 
-def test_cleanup_old_metrics(persistence):
-    """Test metric cleanup"""
-    persistence.log_metric("metric1", 10)
-    persistence.log_metric("metric2", 20)
 
-    deleted = persistence.cleanup_old_metrics(days=0)  # Delete all old
-    # Should delete at least 0 (depends on timing)
-    assert deleted >= 0
+def test_message_rejected_when_auto_register_disabled(authed_store):
+    assert authed_store.save_message(
+        PHONE, CHANNEL, 'Kenh Kin', 1, 'hello', auto_register_channel=False
+    ) is None
 
-# ============================================================================
-# CONFIGURATION TESTS
-# ============================================================================
 
-def test_settings_loading():
-    """Test configuration loading"""
-    settings = Settings()
-    assert settings.telethon_api_id > 0
-    assert settings.telethon_api_hash
-    assert settings.telethon_phone
+def test_duplicate_message_returns_same_row(authed_store):
+    first = authed_store.save_message(PHONE, CHANNEL, 'Kenh Kin', 7, 'hello')
+    second = authed_store.save_message(PHONE, CHANNEL, 'Kenh Kin', 7, 'hello')
+    assert first == second
+    assert authed_store.count_messages() == 1
 
-def test_settings_optional_defaults():
-    """Test optional settings have defaults"""
-    settings = Settings()
-    assert settings.backend_url
-    assert settings.backend_host
-    assert settings.backend_port > 0
-    assert settings.ocr_cache_size > 0
-    assert settings.message_queue_size > 0
 
-# ============================================================================
-# END-TO-END WORKFLOW TESTS
-# ============================================================================
+def test_message_unknown_account(store):
+    assert store.save_message('+99900000000', CHANNEL, 'X', 1, 'hi') is None
+
+
+# ----------------------------------------------------------------------
+# Codes
+# ----------------------------------------------------------------------
+
+def test_code_saved_and_listed(authed_store):
+    msg = authed_store.save_message(PHONE, CHANNEL, 'Kenh Kin', 1, 'Code AB7X9Q2M')
+    assert authed_store.save_code(msg, 'AB7X9Q2M', entropy=3.0) is True
+    codes = authed_store.get_codes()
+    assert [c['code'] for c in codes] == ['AB7X9Q2M']
+
+
+def test_duplicate_code_rejected_and_store_still_usable(authed_store):
+    msg = authed_store.save_message(PHONE, CHANNEL, 'Kenh Kin', 1, 'Code AB7X9Q2M')
+    assert authed_store.save_code(msg, 'AB7X9Q2M') is True
+    assert authed_store.save_code(msg, 'AB7X9Q2M') is False
+    # A rolled-back transaction must not poison later writes.
+    assert authed_store.log_event('INFO', 'test', 'still alive') is True
+
+
+# ----------------------------------------------------------------------
+# Metrics, logs, health
+# ----------------------------------------------------------------------
+
+def test_metrics_and_logs(store):
+    assert store.log_metric('probe', 1.5, {'tag': 'v'}) is True
+    assert store.log_event('INFO', 'test', 'hello', {'k': 'v'}) is True
+    assert len(store.get_logs(limit=5)) == 1
+
+
+def test_health_check(store):
+    assert store.health_check() is True
+
+
+# ----------------------------------------------------------------------
+# Code filter
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("Code hom nay: AB7X9Q2M", ["AB7X9Q2M"]),
+    ("Hai ma: X7f2Kq9L va M4nP8vT2", ["X7f2Kq9L", "M4nP8vT2"]),
+    ("Lien he 0388588488", []),                      # phone number
+    ("Ngay 2026-08-07", []),                          # date
+    ("Xem https://t.me/kenhkin/12345", []),           # url path
+    ("AAAAAAAA", []),                                 # no entropy
+    ("Gia 1500000 VND", []),                          # price
+    ("THANKS ADMIN", []),                             # stopwords
+    ("", []),
+    ("Ma AB7X9Q2M lap lai AB7X9Q2M", ["AB7X9Q2M"]),  # deduplicated
+])
+def test_extract_codes(text, expected):
+    assert extract_codes(text) == expected
+
+
+def test_entropy_ranks_real_codes_above_filler():
+    assert shannon_entropy('AAAAAAAA') < 1.0
+    assert shannon_entropy('AB7X9Q2M') > 2.5
+
+
+def test_all_digit_run_rejected_despite_high_entropy():
+    """Entropy alone is not enough: '12345678' scores high but is never a code."""
+    assert shannon_entropy('12345678') > 2.5
+    assert is_valid_code('12345678') is False
+
+
+def test_repeat_ratio():
+    assert repeat_ratio('AAAA') == 1.0
+    assert repeat_ratio('ABCD') == 0.25
+
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+def test_settings_load_from_env():
+    s = Settings()
+    assert s.telethon_api_id == 1111111
+    assert s.backend_port == 8000
+
+
+def test_missing_required_vars_raise_not_exit(monkeypatch):
+    """Importing or constructing config must never kill the process."""
+    monkeypatch.delenv('TELETHON_API_ID', raising=False)
+    with pytest.raises(ConfigError) as exc:
+        Settings()
+    assert 'TELETHON_API_ID' in str(exc.value)
+
+
+def test_all_missing_vars_reported_together(monkeypatch):
+    for key in ('TELETHON_API_ID', 'TELETHON_API_HASH', 'TELEGRAM_BOT_TOKEN'):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(ConfigError) as exc:
+        Settings()
+    message = str(exc.value)
+    assert all(k in message for k in ('TELETHON_API_ID', 'TELETHON_API_HASH', 'TELEGRAM_BOT_TOKEN'))
+
+
+def test_bad_integer_rejected(monkeypatch):
+    monkeypatch.setenv('BACKEND_PORT', 'not-a-number')
+    with pytest.raises(ConfigError):
+        Settings()
+
+
+def test_config_dict_excludes_secrets():
+    exposed = Settings().to_dict()
+    assert 'bot_token' not in exposed
+    assert 'telethon_api_hash' not in exposed
+
+
+# ----------------------------------------------------------------------
+# End-to-end through the real API
+# ----------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_complete_workflow(persistence):
-    """Test complete workflow from login to code extraction"""
+async def test_message_endpoint_persists_and_extracts(authed_store):
+    """Post a message to the running app and confirm it reaches the database."""
+    from httpx import AsyncClient
+    from pinlives_pro.api import backend as backend_module
 
-    # 1. Save session
-    phone = "+84388588488"
-    session_string = "workflow_test_session"
-    assert persistence.save_session(phone, session_string) is True
+    # Wire the module's globals the way startup() would, without opening a
+    # Telegram connection.
+    backend_module.persistence = authed_store
+    backend_module.telethon_service = object()
+    processor = asyncio.create_task(backend_module.message_processor())
 
-    # 2. Mark authenticated
-    assert persistence.mark_authenticated(phone) is True
+    try:
+        async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+            resp = await client.post('/api/telethon/message', json={
+                'phone': PHONE,
+                'chat_id': CHANNEL,
+                'chat_name': 'Kenh Kin',
+                'message_id': 4242,
+                'text': 'Ma hom nay: Zx9K2mQ7',
+                'has_media': False,
+            })
+            assert resp.status_code == 200
+            assert resp.json()['queued'] is True
 
-    # 3. Add channels
-    channels = [
-        (123456789, "Channel A"),
-        (987654321, "Channel B"),
-    ]
-    for channel_id, channel_name in channels:
-        assert persistence.add_channel(phone, channel_id, channel_name) is True
+            for _ in range(40):
+                await asyncio.sleep(0.1)
+                if authed_store.count_messages() >= 1:
+                    break
 
-    # 4. Receive messages from channels
-    messages = [
-        (123456789, "Channel A", 1, "Secret code ABC123DEF"),
-        (987654321, "Channel B", 2, "Another code XYZ789GHI"),
-    ]
-    for chat_id, chat_name, msg_id, text in messages:
-        saved_id = persistence.save_message(
-            phone=phone,
-            chat_id=chat_id,
-            chat_name=chat_name,
-            message_id=msg_id,
-            text=text,
-            has_media=False
-        )
-        assert saved_id is not None
+        assert authed_store.count_messages() == 1, "message never reached the database"
+        assert [c['code'] for c in authed_store.get_codes()] == ['Zx9K2mQ7']
+    finally:
+        processor.cancel()
+        backend_module.persistence = None
+        backend_module.telethon_service = None
 
-    # 5. Extract codes
-    codes_to_extract = ["ABC123DEF", "XYZ789GHI"]
-    for code in codes_to_extract:
-        # Get the first message ID (simplified for testing)
-        result = persistence.save_code(
-            message_id=1,  # Would be from real message
-            code=code,
-            entropy=2.3,
-            pattern_score=0.85
-        )
-        # First code saves, second fails (unique constraint)
-        assert result in [True, False]
 
-    # 6. Retrieve codes
-    codes = persistence.get_codes(limit=10)
-    assert len(codes) >= 1
+@pytest.mark.asyncio
+async def test_message_without_phone_is_rejected(authed_store):
+    """A payload missing 'phone' used to be accepted and then silently dropped."""
+    from httpx import AsyncClient
+    from pinlives_pro.api import backend as backend_module
 
-    # 7. Log metrics
-    assert persistence.log_metric("messages_processed", 2) is True
-    assert persistence.log_metric("codes_extracted", len(codes)) is True
+    backend_module.persistence = authed_store
+    backend_module.telethon_service = object()
+    try:
+        async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+            resp = await client.post('/api/telethon/message', json={
+                'chat_id': CHANNEL,
+                'chat_name': 'Kenh Kin',
+                'message_id': 1,
+                'text': 'hi',
+            })
+        assert resp.status_code == 422
+    finally:
+        backend_module.persistence = None
+        backend_module.telethon_service = None
 
-    # 8. Log events
-    assert persistence.log_event(
-        level="INFO",
-        component="workflow_test",
-        message="Workflow completed successfully",
-        context={"messages": 2, "codes": len(codes)}
-    ) is True
 
-# ============================================================================
-# ERROR HANDLING TESTS
-# ============================================================================
+@pytest.mark.asyncio
+async def test_unstorable_message_is_not_counted_as_processed(store):
+    """A message that cannot be stored must raise, retry, and be dead-lettered.
 
-def test_load_nonexistent_session(persistence):
-    """Test loading non-existent session"""
-    result = persistence.load_session("nonexistent+12345")
-    assert result is None
+    The original defect let save_message return None unnoticed: the API reported
+    success, the counter incremented, and the message was gone. This test drives
+    the failing path directly, so reverting that check fails the suite.
+    """
+    from pinlives_pro.api import backend as backend_module
 
-def test_save_message_nonexistent_phone(persistence):
-    """Test saving message for non-existent phone"""
-    result = persistence.save_message(
-        phone="nonexistent",
-        chat_id=123,
-        chat_name="Test",
-        message_id=1,
-        text="Test"
-    )
-    assert result is None
+    backend_module.persistence = store  # no session saved, so the write must fail
+    try:
+        with pytest.raises(RuntimeError):
+            await backend_module.process_message({
+                'phone': '+99900000000',
+                'chat_id': CHANNEL,
+                'chat_name': 'Ghost',
+                'message_id': 1,
+                'text': 'Code AB7X9Q2M',
+                'has_media': False,
+            })
+        assert store.count_messages() == 0
+    finally:
+        backend_module.persistence = None
 
-def test_add_channel_nonexistent_session(persistence):
-    """Test adding channel to non-existent session"""
-    result = persistence.add_channel("nonexistent", 123, "Test")
-    assert result is False
 
-def test_duplicate_code(persistence):
-    """Test handling duplicate code extraction"""
-    phone = "+84388588488"
-    persistence.save_session(phone, "test")
-    persistence.mark_authenticated(phone)
-    persistence.add_channel(phone, 123, "Test")
+@pytest.mark.asyncio
+async def test_failed_message_is_retried_then_dead_lettered(store, monkeypatch):
+    """Exhausted retries must leave an audit record, not vanish."""
+    from pinlives_pro.api import backend as backend_module
 
-    msg_id = persistence.save_message(phone, 123, "Test", 1, "Code: TEST", False)
+    backend_module.persistence = store
+    # Collapse the backoff so the test does not wait 14 real seconds.
+    monkeypatch.setattr(backend_module, 'RETRY_BASE_DELAY', 0.01)
 
-    # First save succeeds
-    result1 = persistence.save_code(msg_id, "TEST")
-    assert result1 is True
+    processor = asyncio.create_task(backend_module.message_processor())
+    try:
+        await backend_module.message_queue.enqueue({
+            'phone': '+99900000000',
+            'chat_id': CHANNEL,
+            'chat_name': 'Ghost',
+            'message_id': 77,
+            'text': 'Code AB7X9Q2M',
+            'has_media': False,
+        })
 
-    # Duplicate fails gracefully
-    result2 = persistence.save_code(msg_id, "TEST")
-    assert result2 is False
+        dead_letters = []
+        for _ in range(60):
+            await asyncio.sleep(0.1)
+            dead_letters = [
+                entry for entry in store.get_logs(limit=50)
+                if 'dropped after' in (entry['message'] or '')
+            ]
+            if dead_letters:
+                break
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v', '--tb=short'])
+        assert dead_letters, "message vanished without a dead-letter record"
+        assert store.count_messages() == 0
+    finally:
+        processor.cancel()
+        backend_module.persistence = None
+
+
+@pytest.mark.asyncio
+async def test_endpoints_return_503_before_startup():
+    """Requests that arrive before wiring completes must not raise AttributeError."""
+    from httpx import AsyncClient
+    from pinlives_pro.api import backend as backend_module
+
+    backend_module.persistence = None
+    backend_module.telethon_service = None
+    async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+        resp = await client.get('/api/codes')
+    assert resp.status_code == 503

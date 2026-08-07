@@ -4,8 +4,8 @@ Production-grade persistence with SQLAlchemy ORM
 """
 
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, DateTime,
-    Float, Boolean, LargeBinary, ForeignKey, UniqueConstraint,
+    create_engine, Column, Integer, BigInteger, String, Text, DateTime,
+    Float, Boolean, ForeignKey, UniqueConstraint,
     Index, JSON
 )
 from sqlalchemy.ext.declarative import declarative_base
@@ -54,9 +54,8 @@ class TelegramSession(Base):
     """Stores Telethon session strings for account authentication"""
     __tablename__ = "telegram_sessions"
     __table_args__ = (
-        UniqueConstraint('phone', name='uq_phone'),
-        Index('idx_phone', 'phone'),
-        Index('idx_created_at', 'created_at'),
+        UniqueConstraint('phone', name='uq_session_phone'),
+        Index('idx_session_created_at', 'created_at'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -75,13 +74,14 @@ class MonitoredChannel(Base):
     __tablename__ = "monitored_channels"
     __table_args__ = (
         UniqueConstraint('session_id', 'channel_id', name='uq_session_channel'),
-        Index('idx_session_id', 'session_id'),
-        Index('idx_channel_id', 'channel_id'),
+        Index('idx_channel_session_id', 'session_id'),
+        Index('idx_channel_tg_id', 'channel_id'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(Integer, ForeignKey('telegram_sessions.id'), nullable=False)
-    channel_id = Column(Integer, nullable=False)
+    # Telegram channel IDs exceed 32-bit range (e.g. -1001234567890)
+    channel_id = Column(BigInteger, nullable=False)
     channel_name = Column(String(255), nullable=False)
     added_at = Column(DateTime, default=datetime.utcnow)
 
@@ -92,16 +92,16 @@ class TelegramMessage(Base):
     """Stores received Telegram messages"""
     __tablename__ = "telegram_messages"
     __table_args__ = (
-        Index('idx_session_id', 'session_id'),
-        Index('idx_channel_id', 'channel_id'),
-        Index('idx_received_at', 'received_at'),
-        Index('idx_has_code', 'has_code'),
+        UniqueConstraint('channel_id', 'message_id', name='uq_channel_message'),
+        Index('idx_message_session_id', 'session_id'),
+        Index('idx_message_channel_id', 'channel_id'),
+        Index('idx_message_received_at', 'received_at'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(Integer, ForeignKey('telegram_sessions.id'), nullable=False)
     channel_id = Column(Integer, ForeignKey('monitored_channels.id'), nullable=False)
-    message_id = Column(Integer, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
     text = Column(Text, nullable=True)
     has_media = Column(Boolean, default=False)
     media_path = Column(String(500), nullable=True)
@@ -115,10 +115,10 @@ class ExtractedCode(Base):
     """Code extracted from messages with metadata"""
     __tablename__ = "extracted_codes"
     __table_args__ = (
-        Index('idx_message_id', 'message_id'),
+        Index('idx_code_message_id', 'message_id'),
         Index('idx_code_hash', 'code_hash'),
-        Index('idx_extracted_at', 'extracted_at'),
-        Index('idx_is_valid', 'is_valid'),
+        Index('idx_code_extracted_at', 'extracted_at'),
+        Index('idx_code_is_valid', 'is_valid'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -137,7 +137,7 @@ class SystemMetric(Base):
     """System performance metrics for monitoring"""
     __tablename__ = "system_metrics"
     __table_args__ = (
-        Index('idx_timestamp', 'timestamp'),
+        Index('idx_metric_timestamp', 'timestamp'),
         Index('idx_metric_name', 'metric_name'),
     )
 
@@ -151,8 +151,8 @@ class SystemLog(Base):
     """Structured logging for audit trail"""
     __tablename__ = "system_logs"
     __table_args__ = (
-        Index('idx_timestamp', 'timestamp'),
-        Index('idx_level', 'level'),
+        Index('idx_log_timestamp', 'timestamp'),
+        Index('idx_log_level', 'level'),
     )
 
     id = Column(Integer, primary_key=True, index=True)

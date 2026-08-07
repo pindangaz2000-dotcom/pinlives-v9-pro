@@ -20,15 +20,17 @@ import asyncio
 import aiohttp
 from functools import wraps
 
-from ..models.database import init_db, get_session
+from ..models.database import init_db
 from ..core.persistence import get_persistence
-from ..core.config import Settings
+from ..core.codefilter import extract_codes, shannon_entropy
+from ..core.config import get_settings
+from ..core.logging_setup import setup_logging
+from ..core.telethon_client import TelethonService, TelethonError
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-settings = Settings()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -62,17 +64,25 @@ class TelethonLoginVerifyRequest(BaseModel):
             raise ValueError('OTP must contain only digits')
         return clean
 
+class TelethonPasswordRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=256)
+
 class AddChannelRequest(BaseModel):
     phone: str = Field(..., min_length=7, max_length=20)
-    channel_id: int = Field(..., gt=0)
+    # Telegram supergroup/channel IDs are negative (e.g. -1001234567890), so this
+    # must not be constrained to positive values.
+    channel_id: int
     channel_name: str = Field(..., min_length=1, max_length=255)
 
 class MessagePayload(BaseModel):
+    # phone identifies the receiving account; without it the message cannot be
+    # attributed to a stored session and is silently dropped.
+    phone: str = Field(..., min_length=7, max_length=20)
     chat_id: int
     chat_name: str
     message_id: int
     text: Optional[str] = None
-    date: str
+    date: Optional[str] = None
     has_media: bool = False
     media_path: Optional[str] = None
 
@@ -171,91 +181,188 @@ ocr_cache = OCRCache()
 message_queue = MessageQueue()
 system_monitor = SystemMonitor()
 persistence = None
+telethon_service = None
+_background_tasks = []
 
 # ============================================================================
 # STARTUP & SHUTDOWN
 # ============================================================================
 
+async def _enqueue_from_telethon(payload: Dict[str, Any]) -> None:
+    """Hand a message from the listener to the durable queue."""
+    await message_queue.enqueue(payload)
+
+
+def _require_ready() -> None:
+    """Reject requests that arrive before startup finished wiring things up."""
+    if persistence is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+    if telethon_service is None:
+        raise HTTPException(status_code=503, detail="Telethon service not ready")
+
+
 @app.on_event("startup")
 async def startup():
-    global persistence
+    global persistence, telethon_service
+
+    _boot_settings = get_settings()
+    setup_logging(
+        level=_boot_settings.log_level,
+        log_file=_boot_settings.log_file,
+        component='pinlives.backend',
+    )
+    logger.info("Starting PINLIVES Pro v3.1 backend")
+
+    init_db()
+    persistence = get_persistence()
+    logger.info("Database ready")
+
+    _background_tasks.append(asyncio.create_task(message_processor()))
+
+    # The Telethon client runs in this process so the login endpoints can drive it.
+    settings = get_settings()
+    telethon_service = TelethonService(
+        api_id=settings.telethon_api_id,
+        api_hash=settings.telethon_api_hash,
+        persistence=persistence,
+        on_message=_enqueue_from_telethon,
+        otp_timeout_seconds=settings.otp_timeout_seconds,
+    )
+
+    # Reconnect without operator involvement when a session survives a restart.
     try:
-        logger.info("🚀 Starting PINLIVES Pro v3.1 Backend")
-        init_db()
-        persistence = get_persistence()
-        logger.info("✓ Database initialized")
-        logger.info("✓ Cache system ready")
-        asyncio.create_task(message_processor())
+        if await telethon_service.restore(settings.telethon_phone):
+            logger.info("Reconnected to Telegram from the stored session")
+        else:
+            logger.info("No usable stored session; waiting for a login")
     except Exception as e:
-        logger.error(f"❌ Startup error: {type(e).__name__}: {e}")
-        raise
+        logger.error("Session restore failed: %s: %s", type(e).__name__, e)
+
+    logger.info("Startup complete")
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    try:
-        if persistence:
-            persistence.close()
-        logger.info("✓ Shutdown complete")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+    for task in _background_tasks:
+        task.cancel()
+    if telethon_service:
+        try:
+            await telethon_service.logout()
+        except Exception as e:
+            logger.error("Error disconnecting Telethon: %s", e)
+    logger.info("Shutdown complete")
 
 # ============================================================================
 # MESSAGE PROCESSING BACKGROUND TASK
 # ============================================================================
 
+MAX_ATTEMPTS = 3
+RETRY_BASE_DELAY = 2.0
+
+
+async def _requeue_after_delay(payload: Dict, attempt: int, delay: float) -> None:
+    """Put a failed message back after a delay, without stalling the processor."""
+    try:
+        await asyncio.sleep(delay)
+        await message_queue.enqueue(payload, attempt)
+    except asyncio.CancelledError:
+        logger.warning("Retry cancelled during shutdown, message dropped: %s", payload.get('message_id'))
+
+
 async def message_processor():
-    """Background task processing message queue with retry logic"""
+    """Drain the queue, retrying failures with exponential backoff."""
     logger.info("Starting message processor...")
     while True:
         try:
             item = await message_queue.dequeue()
             if not item:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
             payload = item['data']
             attempt = item['attempts']
 
             try:
-                # Process message
                 await process_message(payload)
                 system_monitor.message_count += 1
                 system_monitor.last_message_time = datetime.utcnow()
 
             except Exception as e:
                 system_monitor.error_count += 1
-                logger.error(f"Error processing message (attempt {attempt}): {type(e).__name__}: {e}")
+                logger.error(
+                    "Error processing message (attempt %s/%s): %s: %s",
+                    attempt, MAX_ATTEMPTS, type(e).__name__, e,
+                )
 
-                if attempt < 3:
-                    # Retry
-                    await message_queue.enqueue(payload, attempt + 1)
-                    logger.info(f"Requeued message (attempt {attempt + 1}/3)")
+                if attempt < MAX_ATTEMPTS:
+                    # Without a growing delay all retries burn off in milliseconds
+                    # and a transient fault never gets a chance to clear.
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.info(
+                        "Retrying message %s in %.0fs (attempt %s/%s)",
+                        payload.get('message_id'), delay, attempt + 1, MAX_ATTEMPTS,
+                    )
+                    _background_tasks.append(
+                        asyncio.create_task(_requeue_after_delay(payload, attempt + 1, delay))
+                    )
                 else:
-                    logger.error(f"Message failed after 3 attempts: {payload}")
+                    # Dead letter: keep the payload so nothing disappears silently.
+                    logger.error("Message dropped after %s attempts: %s", MAX_ATTEMPTS, payload)
+                    if persistence:
+                        persistence.log_event(
+                            'ERROR', 'backend',
+                            f"Message dropped after {MAX_ATTEMPTS} attempts",
+                            {
+                                'phone': payload.get('phone'),
+                                'chat_id': payload.get('chat_id'),
+                                'message_id': payload.get('message_id'),
+                                'text': (payload.get('text') or '')[:500],
+                                'last_error': f"{type(e).__name__}: {e}",
+                            },
+                        )
 
+        except asyncio.CancelledError:
+            logger.info("Message processor stopping")
+            raise
         except Exception as e:
             logger.error(f"Message processor error: {type(e).__name__}: {e}")
             await asyncio.sleep(5)
 
 async def process_message(payload: Dict) -> None:
-    """Process individual message from queue"""
+    """Persist one message. Raises on failure so the caller can retry."""
     if not persistence:
         raise RuntimeError("Persistence not initialized")
 
-    # Save to database
+    phone = payload.get('phone')
+    if not phone:
+        raise ValueError("Message payload is missing 'phone'")
+
     msg_id = persistence.save_message(
-        phone=payload.get('phone', 'unknown'),
+        phone=phone,
         chat_id=payload.get('chat_id'),
         chat_name=payload.get('chat_name'),
         message_id=payload.get('message_id'),
         text=payload.get('text'),
         has_media=payload.get('has_media', False),
-        media_path=payload.get('media_path')
+        media_path=payload.get('media_path'),
     )
 
-    if msg_id and payload.get('text'):
-        # Extract codes from text (placeholder for actual extraction logic)
-        persistence.log_event('INFO', 'backend', f'Message processed: {payload.get("chat_name")}')
+    # A silent None here is how messages used to disappear while the API still
+    # reported success. Fail loudly so the retry path runs.
+    if msg_id is None:
+        raise RuntimeError(
+            f"save_message returned no row id for phone={phone} chat={payload.get('chat_id')}"
+        )
+
+    text = payload.get('text')
+    if text:
+        for code in extract_codes(text):
+            persistence.save_code(msg_id, code, entropy=shannon_entropy(code))
+
+    persistence.log_event(
+        'INFO', 'backend', f"Message stored: {payload.get('chat_name')}",
+        {'chat_id': payload.get('chat_id'), 'message_id': payload.get('message_id')},
+    )
 
 # ============================================================================
 # HEALTH CHECK & MONITORING ENDPOINTS
@@ -263,31 +370,45 @@ async def process_message(payload: Dict) -> None:
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, Any]:
-    """Comprehensive system health check"""
+    """Health probe. Reports degraded rather than healthy when a dependency is down."""
+    db_ok = persistence.health_check() if persistence else False
+    telethon_state = telethon_service.state if telethon_service else 'not_initialized'
+
+    # The database is the only hard dependency: without it messages are lost.
+    # Being signed out is an expected state an operator can fix, not an outage.
+    status_value = 'healthy' if db_ok else 'degraded'
+
     return {
-        'status': 'healthy',
+        'status': status_value,
         'timestamp': datetime.utcnow().isoformat(),
         'uptime_seconds': system_monitor.get_uptime(),
-        'database': 'connected' if persistence else 'disconnected',
+        'database': 'connected' if db_ok else 'disconnected',
+        'telethon_state': telethon_state,
+        'telethon_authenticated': telethon_service.authenticated if telethon_service else False,
         'memory': system_monitor.get_memory_usage(),
         'cpu_percent': system_monitor.get_cpu_usage(),
         'disk': system_monitor.get_disk_usage(),
         'queue_depth': message_queue.size(),
         'message_count': system_monitor.message_count,
         'error_count': system_monitor.error_count,
-        'cache_size': len(ocr_cache.cache)
+        'cache_size': len(ocr_cache.cache),
     }
 
 @app.get("/api/status")
 async def status() -> Dict[str, Any]:
-    """System status and statistics"""
+    """Operational status, including counts read back from the database."""
+    stored_messages = persistence.count_messages() if persistence else 0
+    stored_codes = persistence.count_codes() if persistence else 0
     return {
         'status': 'running',
         'version': '3.1',
         'uptime_seconds': system_monitor.get_uptime(),
         'messages_processed': system_monitor.message_count,
+        'messages_stored': stored_messages,
+        'codes_extracted': stored_codes,
         'errors': system_monitor.error_count,
         'queue_depth': message_queue.size(),
+        'telethon': telethon_service.status() if telethon_service else {'state': 'not_initialized'},
         'last_message': system_monitor.last_message_time.isoformat(),
         'timestamp': datetime.utcnow().isoformat()
     }
@@ -321,114 +442,163 @@ async def get_metrics() -> Dict[str, Any]:
 # ============================================================================
 
 @app.post("/api/telethon/login/start")
-async def telethon_login_start(request: TelethonLoginStartRequest, background_tasks: BackgroundTasks):
-    """Start Telethon login flow"""
+async def telethon_login_start(request: TelethonLoginStartRequest):
+    """Ask Telegram to send a login code to the account."""
+    _require_ready()
+    phone = request.phone
     try:
-        if not persistence:
-            raise HTTPException(status_code=503, detail="Database not available")
-
-        phone = request.phone
-        logger.info(f"Login start for {phone}")
-
-        # Call actual Telethon function (import from daemon)
-        # from telethon_listener_daemon import start_login
-        # result = await start_login(phone)
-
-        persistence.log_event('INFO', 'backend', f'Login started: {phone}')
-        system_monitor.message_count += 1
-
-        return {
-            'success': True,
-            'message': f'✓ Code sent to {phone}',
-            'phone': phone
-        }
-    except Exception as e:
-        logger.error(f"Login start error: {type(e).__name__}: {e}")
-        persistence.log_event('ERROR', 'backend', f'Login failed: {str(e)}')
-        system_monitor.error_count += 1
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/telethon/login/verify")
-async def telethon_login_verify(request: TelethonLoginVerifyRequest):
-    """Verify OTP and complete login"""
-    try:
-        if not persistence:
-            raise HTTPException(status_code=503, detail="Database not available")
-
-        phone = request.phone
-        otp = request.otp
-        logger.info(f"Verifying OTP for {phone}")
-
-        # Call actual Telethon function (import from daemon)
-        # from telethon_listener_daemon import verify_otp
-        # result = await verify_otp(otp)
-
-        persistence.mark_authenticated(phone)
-        persistence.log_event('INFO', 'backend', f'Login verified: {phone}')
-
-        return {
-            'success': True,
-            'message': '✓ Login successful',
-            'authenticated': True
-        }
-    except Exception as e:
-        logger.error(f"OTP verify error: {type(e).__name__}: {e}")
-        persistence.log_event('ERROR', 'backend', f'OTP verification failed: {str(e)}')
+        result = await telethon_service.start_login(phone)
+    except TelethonError as e:
+        persistence.log_event('ERROR', 'backend', f'Login start failed for {phone}: {e}')
         system_monitor.error_count += 1
         raise HTTPException(status_code=400, detail=str(e))
 
+    persistence.log_event('INFO', 'backend', f'Login started: {phone}')
+    return {
+        'success': True,
+        'phone': phone,
+        'state': result['state'],
+        'message': result['message'],
+        'authenticated': telethon_service.authenticated,
+    }
+
+
+@app.post("/api/telethon/login/verify")
+async def telethon_login_verify(request: TelethonLoginVerifyRequest):
+    """Complete sign-in with the code Telegram sent."""
+    _require_ready()
+    try:
+        result = await telethon_service.verify_code(request.otp)
+    except TelethonError as e:
+        persistence.log_event('ERROR', 'backend', f'Login verify failed: {e}')
+        system_monitor.error_count += 1
+        raise HTTPException(status_code=400, detail=str(e))
+
+    persistence.log_event('INFO', 'backend', f'Login verified: {request.phone}')
+    return {
+        'success': True,
+        'state': result['state'],
+        'message': result['message'],
+        'authenticated': telethon_service.authenticated,
+    }
+
+
+@app.post("/api/telethon/login/password")
+async def telethon_login_password(request: TelethonPasswordRequest):
+    """Finish sign-in for an account protected by a 2FA password."""
+    _require_ready()
+    try:
+        result = await telethon_service.verify_password(request.password)
+    except TelethonError as e:
+        system_monitor.error_count += 1
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        'success': True,
+        'state': result['state'],
+        'message': result['message'],
+        'authenticated': telethon_service.authenticated,
+    }
+
+
+@app.get("/api/telethon/state")
+async def telethon_state():
+    """Where the account currently sits in the login flow."""
+    _require_ready()
+    return telethon_service.status()
+
+
+@app.get("/api/telethon/dialogs")
+async def telethon_dialogs(limit: int = 50):
+    """Channels and groups the signed-in account can see."""
+    _require_ready()
+    try:
+        return {'success': True, 'dialogs': await telethon_service.list_dialogs(limit)}
+    except TelethonError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
 @app.post("/api/telethon/channel/add")
 async def add_channel(request: AddChannelRequest):
-    """Add channel to monitoring"""
-    try:
-        if not persistence:
-            raise HTTPException(status_code=503, detail="Database not available")
+    """Register a channel after confirming the account can actually read it."""
+    _require_ready()
 
-        success = persistence.add_channel(
-            request.phone,
-            request.channel_id,
-            request.channel_name
+    # Resolving first means an unreadable channel is rejected here rather than
+    # silently producing a monitored channel that never yields a message.
+    channel_name = request.channel_name
+    if telethon_service.authenticated:
+        try:
+            channel_name = await telethon_service.resolve_channel(request.channel_id)
+        except TelethonError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    if not persistence.add_channel(request.phone, request.channel_id, channel_name):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Channel not added: unknown account {request.phone} or already monitored",
         )
 
-        if not success:
-            raise HTTPException(status_code=400, detail="Failed to add channel")
+    persistence.log_event('INFO', 'backend', f'Channel added: {channel_name}')
+    return {'success': True, 'channel_name': channel_name, 'message': f'Added {channel_name}'}
 
-        return {
-            'success': True,
-            'message': f'✓ Added {request.channel_name}'
-        }
-    except Exception as e:
-        logger.error(f"Add channel error: {type(e).__name__}: {e}")
-        system_monitor.error_count += 1
-        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/channels")
+async def list_channels(phone: str):
+    """Channels registered for an account."""
+    _require_ready()
+    return {'success': True, 'channels': persistence.get_channels(phone)}
+
+
+@app.get("/api/codes")
+async def list_codes(limit: int = 50):
+    """Most recently extracted codes."""
+    _require_ready()
+    return {'success': True, 'codes': persistence.get_codes(limit=limit)}
+
+
+@app.get("/api/logs")
+async def list_logs(limit: int = 20, level: Optional[str] = None):
+    """Recent audit-log entries."""
+    _require_ready()
+    return {'success': True, 'logs': persistence.get_logs(limit=limit, level=level)}
 
 # ============================================================================
 # MESSAGE INGESTION ENDPOINT
 # ============================================================================
 
 @app.post("/api/telethon/message")
-async def receive_message(payload: MessagePayload, background_tasks: BackgroundTasks):
-    """Receive message from Telethon daemon"""
-    try:
-        # Enqueue for async processing
-        await message_queue.enqueue(payload.dict())
-        return {
-            'success': True,
-            'message_id': payload.message_id,
-            'queued': True
-        }
-    except Exception as e:
-        logger.error(f"Message receive error: {type(e).__name__}: {e}")
-        system_monitor.error_count += 1
-        raise HTTPException(status_code=500, detail=str(e))
+async def receive_message(payload: MessagePayload):
+    """Accept a message for processing.
+
+    Used by external producers and by the test suite; the in-process listener
+    enqueues directly. The response says the message was queued, not stored —
+    persistence failures surface through /api/status error counts and the logs.
+    """
+    _require_ready()
+    await message_queue.enqueue(payload.model_dump())
+    return {
+        'success': True,
+        'message_id': payload.message_id,
+        'queued': True,
+        'queue_depth': message_queue.size(),
+    }
 
 # ============================================================================
 # ERROR HANDLERS
 # ============================================================================
 
+def _audit(level: str, message: str) -> None:
+    """Write to the audit log when it exists. Never raises from a handler."""
+    if persistence is None:
+        return
+    try:
+        persistence.log_event(level, 'backend', message)
+    except Exception as e:
+        logger.error("Could not write audit log: %s: %s", type(e).__name__, e)
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    persistence.log_event('WARNING', 'backend', f'HTTP error: {exc.status_code} - {exc.detail}')
+    _audit('WARNING', f'HTTP {exc.status_code} on {request.url.path}: {exc.detail}')
     return JSONResponse(
         status_code=exc.status_code,
         content={'error': exc.detail, 'timestamp': datetime.utcnow().isoformat()}
@@ -437,7 +607,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {type(exc).__name__}: {exc}")
-    persistence.log_event('ERROR', 'backend', f'Unhandled exception: {type(exc).__name__}: {str(exc)}')
+    _audit('ERROR', f'Unhandled {type(exc).__name__} on {request.url.path}: {exc}')
     system_monitor.error_count += 1
     return JSONResponse(
         status_code=500,

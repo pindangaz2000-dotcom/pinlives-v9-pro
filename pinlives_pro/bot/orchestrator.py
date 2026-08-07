@@ -1,429 +1,457 @@
 """
-PINLIVES Pro v3.1 - Telegram Bot Control Panel
-Production-grade with commands, callbacks, and backend integration
+PINLIVES Pro v3.1 - Telegram bot control panel.
+
+The bot is the operator's console: it drives the login flow, registers channels,
+and reports status. All state lives in the backend; the bot only calls its API.
 """
 
-import logging
 import asyncio
-import time
-import sys
+import html
+import logging
 import re
-from datetime import datetime
-from typing import Dict, Optional
+import sys
+from typing import Any, Dict, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ConversationHandler
-)
 import aiohttp
-
-from ..core.config import Settings
-from ..core.persistence import get_persistence
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-settings = Settings()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(settings.log_file),
-        logging.StreamHandler()
-    ]
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
+
+from ..core.config import ConfigError, get_settings, load_settings_or_exit
+from ..core.logging_setup import setup_logging
+
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# CONVERSATION STATES
-# ============================================================================
+# Conversation states
+ASK_PHONE, ASK_CODE, ASK_PASSWORD = range(3)
+ASK_CHANNEL = 100
 
-WAIT_LOGIN_PHONE = 1
-WAIT_LOGIN_OTP = 2
-WAIT_CHANNEL_ID = 3
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
 
-# ============================================================================
-# COMMAND HANDLERS
-# ============================================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start command - show main menu"""
-    persistence = get_persistence()
+# ----------------------------------------------------------------------
+# Backend client
+# ----------------------------------------------------------------------
 
-    if update.effective_user.id != settings.admin_id:
-        await update.message.reply_text("❌ Unauthorized")
-        persistence.log_event('WARNING', 'bot', f'Unauthorized access: {update.effective_user.id}')
-        return
+async def api_call(method: str, path: str, payload: Optional[Dict] = None) -> Dict[str, Any]:
+    """Call the backend. Always returns a dict with 'ok' so callers never crash."""
+    settings = get_settings()
+    url = f"{settings.backend_url}{path}"
+    try:
+        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+            async with session.request(method, url, json=payload) as resp:
+                try:
+                    body = await resp.json()
+                except (aiohttp.ContentTypeError, ValueError):
+                    body = {'error': (await resp.text())[:300]}
+                if resp.status >= 400:
+                    return {'ok': False, 'error': body.get('error') or body.get('detail') or f'HTTP {resp.status}'}
+                return {'ok': True, 'data': body}
+    except asyncio.TimeoutError:
+        return {'ok': False, 'error': 'Backend timed out'}
+    except aiohttp.ClientConnectorError:
+        return {'ok': False, 'error': f'Cannot reach backend at {settings.backend_url}'}
+    except aiohttp.ClientError as e:
+        return {'ok': False, 'error': f'Backend error: {e}'}
 
-    keyboard = [
-        [InlineKeyboardButton("🔐 Login", callback_data='login_start')],
-        [InlineKeyboardButton("📊 Status", callback_data='status')],
-        [InlineKeyboardButton("➕ Add Channel", callback_data='add_channel')],
-        [InlineKeyboardButton("📋 Logs", callback_data='logs')],
-        [InlineKeyboardButton("📈 Stats", callback_data='stats')],
-        [InlineKeyboardButton("⚙️ Config", callback_data='config')],
-        [InlineKeyboardButton("ℹ️ Help", callback_data='help')],
-    ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+def esc(value: Any) -> str:
+    """Escape a value for HTML parse mode."""
+    return html.escape(str(value))
 
+
+def is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id == get_settings().admin_id)
+
+
+async def deny(update: Update) -> None:
+    logger.warning("Unauthorized access from %s", update.effective_user.id if update.effective_user else '?')
+    if update.callback_query:
+        await update.callback_query.answer("Not authorized", show_alert=True)
+    elif update.message:
+        await update.message.reply_text("Not authorized.")
+
+
+# ----------------------------------------------------------------------
+# Menu
+# ----------------------------------------------------------------------
+
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Login", callback_data='login'),
+         InlineKeyboardButton("📊 Status", callback_data='status')],
+        [InlineKeyboardButton("📡 My channels", callback_data='dialogs'),
+         InlineKeyboardButton("➕ Add channel", callback_data='addchan')],
+        [InlineKeyboardButton("🔑 Codes", callback_data='codes'),
+         InlineKeyboardButton("📋 Logs", callback_data='logs')],
+        [InlineKeyboardButton("⚙️ Config", callback_data='config'),
+         InlineKeyboardButton("ℹ️ Help", callback_data='help')],
+    ])
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return await deny(update)
     await update.message.reply_text(
-        "🤖 *PINLIVES Pro v3.1 Control Panel*\n\n"
-        "Select an option:",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+        "<b>PINLIVES Pro v3.1</b>\nControl panel. Pick an action:",
+        reply_markup=main_menu(),
+        parse_mode=ParseMode.HTML,
     )
 
-    persistence.log_event('INFO', 'bot', 'Start command issued')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Help command"""
-    help_text = """
-🤖 *PINLIVES Pro v3.1 Help*
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return await deny(update)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
-*Commands:*
-/start - Show main menu
-/status - System status
-/logs - View logs
-/stats - Statistics
-/help - This message
 
-*Buttons:*
-🔐 Login - Start Telegram authentication
-📊 Status - Check system status
-➕ Add Channel - Add channel to monitor
-📋 Logs - View system logs
-📈 Stats - View statistics
-⚙️ Config - View configuration
-ℹ️ Help - Show help message
+HELP_TEXT = (
+    "<b>PINLIVES Pro v3.1</b>\n\n"
+    "<b>Commands</b>\n"
+    "/start — control panel\n"
+    "/status — system status\n"
+    "/cancel — abort the current step\n"
+    "/help — this message\n\n"
+    "<b>Getting running</b>\n"
+    "1. <b>Login</b> — sign the account in to Telegram. You send the phone, "
+    "Telegram sends a code, you send the code back.\n"
+    "2. <b>My channels</b> — list what the account can see.\n"
+    "3. <b>Add channel</b> — start monitoring one by its ID.\n\n"
+    "Once signed in, messages are captured, codes extracted, and everything "
+    "stored. The session survives a restart, so login is a one-time step."
+)
 
-*Features:*
-✓ Real Telethon library for private channels
-✓ Persistent session storage
-✓ Code extraction with OCR
-✓ Message queue with retry
-✓ System monitoring & health checks
-✓ Full audit logging
 
-*Support:* Contact admin
-"""
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+# ----------------------------------------------------------------------
+# Status / read-only views
+# ----------------------------------------------------------------------
 
-# ============================================================================
-# CALLBACK QUERY HANDLERS
-# ============================================================================
+async def render_status() -> str:
+    result = await api_call('GET', '/api/status')
+    if not result['ok']:
+        return f"❌ {esc(result['error'])}"
+    d = result['data']
+    t = d.get('telethon', {})
+    return (
+        "<b>System status</b>\n"
+        f"Uptime: {d.get('uptime_seconds', 0):.0f}s\n"
+        f"Telegram: <b>{esc(t.get('state'))}</b>"
+        + (f" ({esc(t.get('user'))})" if t.get('user') else "") + "\n"
+        f"Messages stored: {d.get('messages_stored', 0)}\n"
+        f"Codes extracted: {d.get('codes_extracted', 0)}\n"
+        f"Queue depth: {d.get('queue_depth', 0)}\n"
+        f"Errors: {d.get('errors', 0)}"
+    )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle button callbacks"""
+
+async def render_codes() -> str:
+    result = await api_call('GET', '/api/codes?limit=15')
+    if not result['ok']:
+        return f"❌ {esc(result['error'])}"
+    codes = result['data'].get('codes', [])
+    if not codes:
+        return "No codes extracted yet."
+    lines = ["<b>Recent codes</b>"]
+    for c in codes:
+        entropy = c.get('entropy')
+        suffix = f"  <i>H={entropy:.1f}</i>" if isinstance(entropy, (int, float)) else ""
+        lines.append(f"<code>{esc(c['code'])}</code>{suffix}")
+    return "\n".join(lines)
+
+
+async def render_logs() -> str:
+    result = await api_call('GET', '/api/logs?limit=15')
+    if not result['ok']:
+        return f"❌ {esc(result['error'])}"
+    logs = result['data'].get('logs', [])
+    if not logs:
+        return "No log entries yet."
+    lines = ["<b>Recent activity</b>"]
+    for entry in logs:
+        ts = (entry.get('timestamp') or '')[11:19]
+        lines.append(f"<code>{ts}</code> [{esc(entry.get('level'))}] {esc(entry.get('message'))}")
+    return "\n".join(lines)
+
+
+async def render_dialogs() -> str:
+    result = await api_call('GET', '/api/telethon/dialogs?limit=30')
+    if not result['ok']:
+        return f"❌ {esc(result['error'])}\n\nSign in first with 🔐 Login."
+    dialogs = result['data'].get('dialogs', [])
+    if not dialogs:
+        return "The account is not in any channel or group."
+    lines = ["<b>Visible channels</b>", "<i>Use the ID with ➕ Add channel</i>", ""]
+    for d in dialogs:
+        lines.append(f"<code>{esc(d['channel_id'])}</code> — {esc(d['channel_name'])}")
+    return "\n".join(lines)
+
+
+async def render_config() -> str:
+    settings = get_settings()
+    lines = ["<b>Configuration</b>"]
+    for key, value in settings.to_dict().items():
+        lines.append(f"{esc(key)}: <code>{esc(value)}</code>")
+    return "\n".join(lines)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        return await deny(update)
+    await update.message.reply_text(await render_status(), parse_mode=ParseMode.HTML)
+
+
+async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the buttons that need no follow-up input."""
+    if not is_admin(update):
+        return await deny(update)
+
     query = update.callback_query
-    user_id = update.effective_user.id
-    persistence = get_persistence()
+    await query.answer()
+    action = query.data
 
-    if user_id != settings.admin_id:
-        await query.answer("❌ Unauthorized", show_alert=True)
-        return
+    renderers = {
+        'status': render_status,
+        'codes': render_codes,
+        'logs': render_logs,
+        'dialogs': render_dialogs,
+        'config': render_config,
+    }
 
+    if action == 'help':
+        text = HELP_TEXT
+    elif action in renderers:
+        text = await renderers[action]()
+    else:
+        text = "Unknown action."
+
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu())
+
+
+# ----------------------------------------------------------------------
+# Login conversation
+# ----------------------------------------------------------------------
+
+async def login_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update):
+        await deny(update)
+        return ConversationHandler.END
+
+    query = update.callback_query
     await query.answer()
 
-    if query.data == 'login_start':
+    state = await api_call('GET', '/api/telethon/state')
+    if state['ok'] and state['data'].get('authenticated'):
         await query.edit_message_text(
-            "🔐 *Login to Telegram*\n\n"
-            "Please send your phone number (e.g., +84388588488):"
+            f"Already signed in as {esc(state['data'].get('user'))}.",
+            parse_mode=ParseMode.HTML, reply_markup=main_menu(),
         )
-        persistence.log_event('INFO', 'bot', 'Login started')
-        return WAIT_LOGIN_PHONE
+        return ConversationHandler.END
 
-    elif query.data == 'status':
-        status_text = await get_status_text()
-        await query.edit_message_text(status_text, parse_mode=ParseMode.MARKDOWN)
+    default_phone = get_settings().telethon_phone
+    await query.edit_message_text(
+        f"Send the phone number to sign in.\nDefault: <code>{esc(default_phone)}</code>\n"
+        "Send <code>ok</code> to use it, or /cancel to stop.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_PHONE
 
-    elif query.data == 'add_channel':
-        await query.edit_message_text(
-            "➕ *Add Channel*\n\n"
-            "Please send the channel ID:"
+
+async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = (update.message.text or '').strip()
+    phone = get_settings().telethon_phone if raw.lower() in {'ok', 'y', 'yes'} else raw
+    phone = re.sub(r'[\s\-().]', '', phone)
+
+    if not re.fullmatch(r'\+?\d{7,20}', phone):
+        await update.message.reply_text("That is not a phone number. Try again, or /cancel.")
+        return ASK_PHONE
+
+    context.user_data['phone'] = phone
+    await update.message.reply_text("Requesting a code from Telegram…")
+
+    result = await api_call('POST', '/api/telethon/login/start', {'phone': phone})
+    if not result['ok']:
+        await update.message.reply_text(
+            f"❌ {esc(result['error'])}\n\nSend another number, or /cancel.",
+            parse_mode=ParseMode.HTML,
         )
-        return WAIT_CHANNEL_ID
+        return ASK_PHONE
 
-    elif query.data == 'logs':
-        logs_text = await get_logs_text()
-        await query.edit_message_text(logs_text, parse_mode=ParseMode.MARKDOWN)
+    data = result['data']
+    if data.get('authenticated'):
+        await update.message.reply_text(
+            f"✓ {esc(data.get('message'))}", parse_mode=ParseMode.HTML, reply_markup=main_menu()
+        )
+        return ConversationHandler.END
 
-    elif query.data == 'stats':
-        stats_text = await get_stats_text()
-        await query.edit_message_text(stats_text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"✓ {esc(data.get('message'))}\n\nSend the code Telegram just sent you. "
+        "Spaces and dashes are fine.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_CODE
 
-    elif query.data == 'config':
-        config_text = get_config_text()
-        await query.edit_message_text(config_text, parse_mode=ParseMode.MARKDOWN)
 
-    elif query.data == 'help':
-        help_text = """
-🤖 *PINLIVES Pro v3.1 Control Panel*
+async def login_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Telegram shows the code as "12 345"; operators paste it in many shapes.
+    otp = re.sub(r'[\s\-,_.]', '', (update.message.text or '').strip())
+    if not otp.isdigit() or not (4 <= len(otp) <= 8):
+        await update.message.reply_text("The code should be 4-8 digits. Try again, or /cancel.")
+        return ASK_CODE
 
-*Main Features:*
-1. 🔐 Login to Telegram account
-2. 📊 Monitor system status
-3. ➕ Add channels to monitor
-4. 📋 View system logs
-5. 📈 View statistics
-6. ⚙️ View configuration
-7. ℹ️ Get help
+    result = await api_call('POST', '/api/telethon/login/verify',
+                            {'phone': context.user_data.get('phone', ''), 'otp': otp})
+    if not result['ok']:
+        error = result['error']
+        if '2FA' in error or 'password' in error.lower():
+            await update.message.reply_text(
+                "This account has a 2FA password. Send it now, or /cancel."
+            )
+            return ASK_PASSWORD
+        await update.message.reply_text(
+            f"❌ {esc(error)}\n\nTry the code again, or /cancel.", parse_mode=ParseMode.HTML
+        )
+        return ASK_CODE
 
-*How to Use:*
-- Use buttons to navigate
-- Send required information when prompted
-- All actions are logged for audit trail
+    await update.message.reply_text(
+        f"✓ {esc(result['data'].get('message'))}\n\nListening for messages now.",
+        parse_mode=ParseMode.HTML, reply_markup=main_menu(),
+    )
+    return ConversationHandler.END
 
-*Security:*
-- Only admin can access
-- Credentials stored securely
-- All operations logged
-"""
-        await query.edit_message_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    password = (update.message.text or '').strip()
 
-async def get_status_text() -> str:
-    """Get system status"""
+    # The password should not linger in the chat history.
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{settings.backend_url}/api/status") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return f"""
-📊 *System Status*
+        await update.message.delete()
+    except Exception:
+        logger.debug("Could not delete the password message")
 
-Status: `{data.get('status')}`
-Version: `{data.get('version')}`
-Uptime: `{data.get('uptime_seconds', 0):.0f}s`
-Messages: `{data.get('messages_processed', 0)}`
-Errors: `{data.get('errors', 0)}`
-Queue: `{data.get('queue_depth', 0)}`
-Last Message: `{data.get('last_message', 'N/A')}`
-"""
-    except Exception as e:
-        logger.error(f"Error getting status: {e}")
-        return f"❌ Error getting status: {str(e)}"
+    result = await api_call('POST', '/api/telethon/login/password', {'password': password})
+    if not result['ok']:
+        await update.effective_chat.send_message(
+            f"❌ {esc(result['error'])}\n\nSend the password again, or /cancel.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ASK_PASSWORD
 
-async def get_logs_text() -> str:
-    """Get system logs"""
+    await update.effective_chat.send_message(
+        f"✓ {esc(result['data'].get('message'))}", parse_mode=ParseMode.HTML, reply_markup=main_menu()
+    )
+    return ConversationHandler.END
+
+
+# ----------------------------------------------------------------------
+# Add-channel conversation
+# ----------------------------------------------------------------------
+
+async def channel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update):
+        await deny(update)
+        return ConversationHandler.END
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Send the channel ID to monitor, for example <code>-1001234567890</code>.\n"
+        "Use 📡 My channels to look one up. /cancel to stop.",
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_CHANNEL
+
+
+async def channel_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = (update.message.text or '').strip()
     try:
-        with open(settings.log_file, 'r') as f:
-            lines = f.readlines()
-            recent = ''.join(lines[-10:])
-            return f"""
-📋 *Recent Logs*
-
-```
-{recent}
-```
-"""
-    except Exception as e:
-        logger.error(f"Error reading logs: {e}")
-        return f"❌ Error reading logs: {str(e)}"
-
-async def get_stats_text() -> str:
-    """Get system statistics"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{settings.backend_url}/api/metrics") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    mem = data.get('memory', {})
-                    cpu = data.get('cpu', 0)
-                    disk = data.get('disk', {})
-                    queue = data.get('queue', {})
-                    cache = data.get('cache', {})
-                    messages = data.get('messages', {})
-
-                    return f"""
-📈 *System Statistics*
-
-*Performance:*
-CPU: `{cpu:.1f}%`
-Memory: `{mem.get('rss_mb', 0):.1f}MB`
-Disk: `{disk.get('used_gb', 0):.1f}GB / {disk.get('total_gb', 0):.1f}GB`
-
-*Queue:*
-Depth: `{queue.get('depth', 0)}`
-Max Size: `{queue.get('max_size', 0)}`
-
-*Cache:*
-Size: `{cache.get('size', 0)}`
-Max Size: `{cache.get('max_size', 0)}`
-
-*Messages:*
-Processed: `{messages.get('processed', 0)}`
-Errors: `{messages.get('errors', 0)}`
-Error Rate: `{messages.get('error_rate', 0):.2f}%`
-"""
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return f"❌ Error getting stats: {str(e)}"
-
-def get_config_text() -> str:
-    """Get configuration info"""
-    config = settings.to_dict()
-    config_lines = [f"`{k}`: `{v}`" for k, v in config.items()]
-    return "⚙️ *Configuration*\n\n" + "\n".join(config_lines)
-
-# ============================================================================
-# MESSAGE HANDLERS FOR MULTI-STEP CONVERSATIONS
-# ============================================================================
-
-async def handle_login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle phone input for login"""
-    persistence = get_persistence()
-    phone = update.message.text.strip()
-
-    # Validate phone format
-    if not re.match(r'^\+?[0-9]{7,20}$', phone.replace(' ', '').replace('-', '')):
-        await update.message.reply_text("❌ Invalid phone format. Please use format like +84388588488")
-        return WAIT_LOGIN_PHONE
-
-    try:
-        # Call backend to start login
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{settings.backend_url}/api/telethon/login/start",
-                json={"phone": phone}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await update.message.reply_text(
-                        f"✓ {data.get('message')}\n\n"
-                        "Please send the OTP code sent to your Telegram account:"
-                    )
-                    context.user_data['phone'] = phone
-                    persistence.log_event('INFO', 'bot', f'Login started for {phone}')
-                    return WAIT_LOGIN_OTP
-                else:
-                    error = await resp.text()
-                    await update.message.reply_text(f"❌ Error: {error}")
-                    return WAIT_LOGIN_PHONE
-    except Exception as e:
-        logger.error(f"Error starting login: {e}")
-        persistence.log_event('ERROR', 'bot', f'Login error: {str(e)}')
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        return WAIT_LOGIN_PHONE
-
-async def handle_login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle OTP input for login"""
-    persistence = get_persistence()
-    otp = update.message.text.strip()
-    otp = re.sub(r'[\s\-,_.]', '', otp)  # Parse various formats
-
-    if not otp.isdigit() or len(otp) < 4:
-        await update.message.reply_text("❌ Invalid OTP. Please send digits only.")
-        return WAIT_LOGIN_OTP
-
-    try:
-        phone = context.user_data.get('phone')
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{settings.backend_url}/api/telethon/login/verify",
-                json={"phone": phone, "otp": otp}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await update.message.reply_text(f"✓ {data.get('message')}")
-                    persistence.log_event('INFO', 'bot', f'Login verified for {phone}')
-                    return ConversationHandler.END
-                else:
-                    error = await resp.text()
-                    await update.message.reply_text(f"❌ Error: {error}")
-                    return WAIT_LOGIN_OTP
-    except Exception as e:
-        logger.error(f"Error verifying OTP: {e}")
-        persistence.log_event('ERROR', 'bot', f'OTP error: {str(e)}')
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        return WAIT_LOGIN_OTP
-
-async def handle_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle channel ID input"""
-    persistence = get_persistence()
-    text = update.message.text.strip()
-
-    try:
-        channel_id = int(text)
+        channel = int(raw)
     except ValueError:
-        await update.message.reply_text("❌ Invalid channel ID. Please send a number.")
-        return WAIT_CHANNEL_ID
+        await update.message.reply_text("That is not a channel ID. Try again, or /cancel.")
+        return ASK_CHANNEL
 
-    try:
-        phone = settings.telethon_phone
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{settings.backend_url}/api/telethon/channel/add",
-                json={"phone": phone, "channel_id": channel_id, "channel_name": f"Channel_{channel_id}"}
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    await update.message.reply_text(f"✓ {data.get('message')}")
-                    persistence.log_event('INFO', 'bot', f'Channel added: {channel_id}')
-                    return ConversationHandler.END
-                else:
-                    error = await resp.text()
-                    await update.message.reply_text(f"❌ Error: {error}")
-                    return WAIT_CHANNEL_ID
-    except Exception as e:
-        logger.error(f"Error adding channel: {e}")
-        persistence.log_event('ERROR', 'bot', f'Add channel error: {str(e)}')
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        return WAIT_CHANNEL_ID
+    result = await api_call('POST', '/api/telethon/channel/add', {
+        'phone': get_settings().telethon_phone,
+        'channel_id': channel,
+        'channel_name': f'Channel_{channel}',
+    })
+    if not result['ok']:
+        await update.message.reply_text(
+            f"❌ {esc(result['error'])}\n\nTry another ID, or /cancel.", parse_mode=ParseMode.HTML
+        )
+        return ASK_CHANNEL
 
-# ============================================================================
-# MAIN APPLICATION
-# ============================================================================
+    await update.message.reply_text(
+        f"✓ Monitoring <b>{esc(result['data'].get('channel_name'))}</b>",
+        parse_mode=ParseMode.HTML, reply_markup=main_menu(),
+    )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("Cancelled.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+
+# ----------------------------------------------------------------------
+# Wiring
+# ----------------------------------------------------------------------
+
+def build_application(token: str) -> Application:
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+
+    login_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(login_entry, pattern=r'^login$')],
+        states={
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
+            ASK_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_code)],
+            ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    channel_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(channel_entry, pattern=r'^addchan$')],
+        states={ASK_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_id)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(login_conv)
+    app.add_handler(channel_conv)
+
+    # Registered last so the conversations claim their own callbacks first.
+    app.add_handler(CallbackQueryHandler(
+        on_menu_button, pattern=r'^(status|codes|logs|dialogs|config|help)$'))
+
+    return app
+
 
 def main():
-    """Start bot application"""
-    logger.info("=" * 80)
-    logger.info("Starting PINLIVES Pro v3.1 Telegram Bot")
-    logger.info("=" * 80)
+    settings = load_settings_or_exit()
+    setup_logging(level=settings.log_level, log_file=settings.log_file, component='pinlives.bot')
 
-    app = Application.builder().token(settings.bot_token).build()
+    logger.info("Starting PINLIVES Pro v3.1 bot")
+    logger.info("Admin: %s | Backend: %s", settings.admin_id, settings.backend_url)
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-
-    # Conversation handler for login
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_callback, pattern='^login_start$')],
-        states={
-            WAIT_LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_phone)],
-            WAIT_LOGIN_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_login_otp)],
-            WAIT_CHANNEL_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_channel)],
-        },
-        fallbacks=[]
-    )
-
-    app.add_handler(conv_handler)
-
-    # General callbacks
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    logger.info("✓ Bot started")
-    logger.info(f"Admin ID: {settings.admin_id}")
-    logger.info(f"Backend: {settings.backend_url}")
-
-    get_persistence().log_event('INFO', 'bot', 'Bot started')
-
-    # Start polling
+    app = build_application(settings.bot_token)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {type(e).__name__}: {e}")
-        print(f"FATAL ERROR: {e}", file=sys.stderr)
+        logger.info("Interrupted")
+    except ConfigError as e:
+        print(f"\n{e}\n", file=sys.stderr)
         sys.exit(1)

@@ -1,315 +1,427 @@
 """
 PINLIVES Pro v3.1 - Persistence Layer
-Handles all database operations with error recovery
+
+Every operation runs in its own short-lived SQLAlchemy session. A Session is not
+safe to share between concurrent tasks, and this layer is used from both request
+handlers and the background message processor at the same time.
 """
 
-import logging
-from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError, OperationalError
 import hashlib
+import logging
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..models.database import (
-    SessionLocal, TelegramSession, MonitoredChannel,
-    TelegramMessage, ExtractedCode, SystemMetric, SystemLog
+    ExtractedCode,
+    MonitoredChannel,
+    SessionLocal,
+    SystemLog,
+    SystemMetric,
+    TelegramMessage,
+    TelegramSession,
 )
 
 logger = logging.getLogger(__name__)
 
+
 class PersistenceManager:
-    """Unified database access layer with error handling"""
+    """Database access layer. Safe to share across concurrent tasks."""
 
-    def __init__(self):
-        self.db: Session = SessionLocal()
-        self.retry_attempts = 3
-        self.retry_delay = 1
+    @contextmanager
+    def _session(self):
+        """One unit of work: commit on success, roll back on failure, always close."""
+        session = SessionLocal()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
-    def _execute_with_retry(self, operation, *args, **kwargs) -> Any:
-        """Execute database operation with retry logic"""
-        for attempt in range(self.retry_attempts):
-            try:
-                return operation(*args, **kwargs)
-            except OperationalError as e:
-                if attempt < self.retry_attempts - 1:
-                    logger.warning(f"DB operation failed, retrying: {e}")
-                    import asyncio
-                    asyncio.sleep(self.retry_delay)
-                else:
-                    logger.error(f"DB operation failed after {self.retry_attempts} attempts: {e}")
-                    raise
-            except Exception as e:
-                logger.error(f"Unexpected DB error: {type(e).__name__}: {e}")
-                raise
-
-    # ============================================================================
-    # TELEGRAM SESSION OPERATIONS
-    # ============================================================================
+    # ------------------------------------------------------------------
+    # Telethon sessions
+    # ------------------------------------------------------------------
 
     def save_session(self, phone: str, session_string: str) -> bool:
-        """Save or update Telethon session"""
+        """Create or update the stored StringSession for an account."""
         try:
-            existing = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if existing:
-                existing.session_string = session_string
-                existing.updated_at = datetime.utcnow()
-                logger.info(f"✓ Session updated: {phone}")
-            else:
-                session = TelegramSession(phone=phone, session_string=session_string)
-                self.db.add(session)
-                logger.info(f"✓ Session created: {phone}")
-
-            self.db.commit()
+            with self._session() as db:
+                existing = db.query(TelegramSession).filter_by(phone=phone).first()
+                if existing:
+                    existing.session_string = session_string
+                    existing.updated_at = datetime.utcnow()
+                    logger.info("Session updated: %s", phone)
+                else:
+                    db.add(TelegramSession(phone=phone, session_string=session_string))
+                    logger.info("Session created: %s", phone)
             return True
-        except IntegrityError as e:
-            self.db.rollback()
-            logger.error(f"Integrity error saving session: {e}")
-            return False
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error saving session: {type(e).__name__}: {e}")
+        except SQLAlchemyError as e:
+            logger.error("Error saving session for %s: %s: %s", phone, type(e).__name__, e)
             return False
 
     def load_session(self, phone: str) -> Optional[str]:
-        """Load session string from database"""
+        """Return the stored StringSession, or None when there is none."""
         try:
-            session = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if session:
-                logger.info(f"✓ Session loaded: {phone}")
-                return session.session_string
-            logger.debug(f"No session found: {phone}")
-            return None
-        except Exception as e:
-            logger.error(f"Error loading session: {type(e).__name__}: {e}")
+            with self._session() as db:
+                row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if row is None:
+                    logger.debug("No session stored for %s", phone)
+                    return None
+                logger.info("Session loaded: %s", phone)
+                return row.session_string
+        except SQLAlchemyError as e:
+            logger.error("Error loading session for %s: %s: %s", phone, type(e).__name__, e)
             return None
 
     def mark_authenticated(self, phone: str) -> bool:
-        """Mark session as authenticated"""
         try:
-            session = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if session:
-                session.is_active = True
-                session.authenticated_at = datetime.utcnow()
-                self.db.commit()
-                logger.info(f"✓ Session authenticated: {phone}")
-                return True
-            return False
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error marking session authenticated: {e}")
+            with self._session() as db:
+                row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if row is None:
+                    logger.error("Cannot mark authenticated, no session for %s", phone)
+                    return False
+                row.is_active = True
+                row.authenticated_at = datetime.utcnow()
+            logger.info("Session authenticated: %s", phone)
+            return True
+        except SQLAlchemyError as e:
+            logger.error("Error marking authenticated: %s: %s", type(e).__name__, e)
             return False
 
-    # ============================================================================
-    # CHANNEL OPERATIONS
-    # ============================================================================
+    def is_authenticated(self, phone: str) -> bool:
+        try:
+            with self._session() as db:
+                row = db.query(TelegramSession).filter_by(phone=phone).first()
+                return bool(row and row.is_active)
+        except SQLAlchemyError as e:
+            logger.error("Error checking auth state: %s: %s", type(e).__name__, e)
+            return False
+
+    # ------------------------------------------------------------------
+    # Channels
+    # ------------------------------------------------------------------
 
     def add_channel(self, phone: str, channel_id: int, channel_name: str) -> bool:
-        """Add channel to monitoring list"""
+        """Register a channel. False when the account is unknown or it already exists."""
         try:
-            session = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if not session:
-                logger.error(f"Session not found: {phone}")
-                return False
+            with self._session() as db:
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    logger.error("Cannot add channel, no session for %s", phone)
+                    return False
 
-            # Check if already exists
-            existing = self.db.query(MonitoredChannel).filter_by(
-                session_id=session.id, channel_id=channel_id
-            ).first()
-            if existing:
-                logger.warning(f"Channel already monitored: {channel_name}")
-                return False
+                exists = db.query(MonitoredChannel).filter_by(
+                    session_id=session_row.id, channel_id=channel_id
+                ).first()
+                if exists:
+                    logger.warning("Channel already monitored: %s", channel_name)
+                    return False
 
-            channel = MonitoredChannel(
-                session_id=session.id,
-                channel_id=channel_id,
-                channel_name=channel_name
-            )
-            self.db.add(channel)
-            self.db.commit()
-            logger.info(f"✓ Channel added: {channel_name} ({channel_id})")
+                db.add(MonitoredChannel(
+                    session_id=session_row.id,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                ))
+            logger.info("Channel added: %s (%s)", channel_name, channel_id)
             return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error adding channel: {type(e).__name__}: {e}")
+        except IntegrityError:
+            logger.warning("Channel already monitored (race): %s", channel_name)
+            return False
+        except SQLAlchemyError as e:
+            logger.error("Error adding channel: %s: %s", type(e).__name__, e)
             return False
 
     def get_channels(self, phone: str) -> List[Dict[str, Any]]:
-        """Get all channels for a session"""
         try:
-            session = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if not session:
-                return []
-
-            channels = self.db.query(MonitoredChannel).filter_by(session_id=session.id).all()
-            return [
-                {
-                    'channel_id': c.channel_id,
-                    'channel_name': c.channel_name,
-                    'added_at': c.added_at.isoformat()
-                }
-                for c in channels
-            ]
-        except Exception as e:
-            logger.error(f"Error getting channels: {type(e).__name__}: {e}")
+            with self._session() as db:
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    return []
+                rows = db.query(MonitoredChannel).filter_by(session_id=session_row.id).all()
+                return [
+                    {
+                        'channel_id': r.channel_id,
+                        'channel_name': r.channel_name,
+                        'added_at': r.added_at.isoformat() if r.added_at else None,
+                    }
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error("Error listing channels: %s: %s", type(e).__name__, e)
             return []
 
-    # ============================================================================
-    # MESSAGE OPERATIONS
-    # ============================================================================
+    # ------------------------------------------------------------------
+    # Messages
+    # ------------------------------------------------------------------
 
-    def save_message(self, phone: str, chat_id: int, chat_name: str,
-                     message_id: int, text: str, has_media: bool = False,
-                     media_path: Optional[str] = None) -> Optional[int]:
-        """Save received message to database"""
+    def save_message(
+        self,
+        phone: str,
+        chat_id: int,
+        chat_name: str,
+        message_id: int,
+        text: Optional[str],
+        has_media: bool = False,
+        media_path: Optional[str] = None,
+        auto_register_channel: bool = True,
+    ) -> Optional[int]:
+        """Store a received message and return its row id.
+
+        The listener subscribes to every incoming message, so a chat is often seen
+        before anyone registers it. With auto_register_channel the chat is recorded
+        on first sight instead of the message being dropped.
+
+        Returns None on failure. Returns the existing row id when the same
+        (channel, message_id) has already been stored.
+        """
         try:
-            session = self.db.query(TelegramSession).filter_by(phone=phone).first()
-            if not session:
-                logger.error(f"Session not found: {phone}")
-                return None
+            with self._session() as db:
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    logger.error("Cannot save message, no session for %s", phone)
+                    return None
 
-            channel = self.db.query(MonitoredChannel).filter_by(
-                session_id=session.id, channel_id=chat_id
-            ).first()
-            if not channel:
-                logger.error(f"Channel not found: {chat_id}")
-                return None
+                channel = db.query(MonitoredChannel).filter_by(
+                    session_id=session_row.id, channel_id=chat_id
+                ).first()
 
-            message = TelegramMessage(
-                session_id=session.id,
-                channel_id=channel.id,
-                message_id=message_id,
-                text=text,
-                has_media=has_media,
-                media_path=media_path
-            )
-            self.db.add(message)
-            self.db.commit()
-            logger.info(f"✓ Message saved: {chat_name} - {text[:50] if text else '(media)'}")
-            return message.id
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error saving message: {type(e).__name__}: {e}")
+                if channel is None:
+                    if not auto_register_channel:
+                        logger.error("Cannot save message, channel %s not registered", chat_id)
+                        return None
+                    channel = MonitoredChannel(
+                        session_id=session_row.id,
+                        channel_id=chat_id,
+                        channel_name=chat_name or f"Chat_{chat_id}",
+                    )
+                    db.add(channel)
+                    db.flush()
+                    logger.info("Auto-registered channel: %s (%s)", chat_name, chat_id)
+
+                duplicate = db.query(TelegramMessage).filter_by(
+                    channel_id=channel.id, message_id=message_id
+                ).first()
+                if duplicate:
+                    logger.debug("Message already stored: %s/%s", chat_id, message_id)
+                    return duplicate.id
+
+                message = TelegramMessage(
+                    session_id=session_row.id,
+                    channel_id=channel.id,
+                    message_id=message_id,
+                    text=text,
+                    has_media=has_media,
+                    media_path=media_path,
+                )
+                db.add(message)
+                db.flush()
+                new_id = message.id
+
+            logger.info("Message saved: %s - %s", chat_name, (text or '(media)')[:50])
+            return new_id
+        except IntegrityError:
+            logger.debug("Message already stored (race): %s/%s", chat_id, message_id)
+            return self._find_message_id(phone, chat_id, message_id)
+        except SQLAlchemyError as e:
+            logger.error("Error saving message: %s: %s", type(e).__name__, e)
             return None
 
-    # ============================================================================
-    # CODE EXTRACTION OPERATIONS
-    # ============================================================================
+    def _find_message_id(self, phone: str, chat_id: int, message_id: int) -> Optional[int]:
+        try:
+            with self._session() as db:
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    return None
+                channel = db.query(MonitoredChannel).filter_by(
+                    session_id=session_row.id, channel_id=chat_id
+                ).first()
+                if channel is None:
+                    return None
+                row = db.query(TelegramMessage).filter_by(
+                    channel_id=channel.id, message_id=message_id
+                ).first()
+                return row.id if row else None
+        except SQLAlchemyError:
+            return None
 
-    def save_code(self, message_id: int, code: str, entropy: float = None,
-                  pattern_score: float = None, ocr_confidence: float = None) -> bool:
-        """Save extracted code"""
+    def get_messages(self, limit: int = 50) -> List[Dict[str, Any]]:
+        try:
+            with self._session() as db:
+                rows = (
+                    db.query(TelegramMessage)
+                    .order_by(TelegramMessage.received_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                return [
+                    {
+                        'id': r.id,
+                        'message_id': r.message_id,
+                        'text': r.text,
+                        'has_media': r.has_media,
+                        'received_at': r.received_at.isoformat() if r.received_at else None,
+                    }
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error("Error listing messages: %s: %s", type(e).__name__, e)
+            return []
+
+    # ------------------------------------------------------------------
+    # Extracted codes
+    # ------------------------------------------------------------------
+
+    def save_code(
+        self,
+        message_id: int,
+        code: str,
+        entropy: Optional[float] = None,
+        pattern_score: Optional[float] = None,
+        ocr_confidence: Optional[float] = None,
+    ) -> bool:
+        """Store an extracted code. False when the code was already recorded."""
         try:
             code_hash = hashlib.sha256(code.encode()).hexdigest()
-
-            extracted = ExtractedCode(
-                message_id=message_id,
-                code=code,
-                code_hash=code_hash,
-                is_valid=True,
-                entropy=entropy,
-                pattern_score=pattern_score,
-                ocr_confidence=ocr_confidence
-            )
-            self.db.add(extracted)
-            self.db.commit()
-            logger.info(f"✓ Code saved: {code[:20]}... (entropy={entropy:.2f})")
+            with self._session() as db:
+                db.add(ExtractedCode(
+                    message_id=message_id,
+                    code=code,
+                    code_hash=code_hash,
+                    is_valid=True,
+                    entropy=entropy,
+                    pattern_score=pattern_score,
+                    ocr_confidence=ocr_confidence,
+                ))
+            logger.info("Code saved: %s", code[:20])
             return True
         except IntegrityError:
-            self.db.rollback()
-            logger.warning(f"Code already exists: {code}")
+            logger.warning("Code already recorded: %s", code)
             return False
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error saving code: {type(e).__name__}: {e}")
+        except SQLAlchemyError as e:
+            logger.error("Error saving code: %s: %s", type(e).__name__, e)
             return False
 
     def get_codes(self, limit: int = 100, valid_only: bool = True) -> List[Dict[str, Any]]:
-        """Get extracted codes with filtering"""
         try:
-            query = self.db.query(ExtractedCode)
-            if valid_only:
-                query = query.filter_by(is_valid=True)
-
-            codes = query.order_by(ExtractedCode.extracted_at.desc()).limit(limit).all()
-            return [
-                {
-                    'code': c.code,
-                    'entropy': c.entropy,
-                    'pattern_score': c.pattern_score,
-                    'confidence': c.ocr_confidence,
-                    'extracted_at': c.extracted_at.isoformat()
-                }
-                for c in codes
-            ]
-        except Exception as e:
-            logger.error(f"Error getting codes: {type(e).__name__}: {e}")
+            with self._session() as db:
+                query = db.query(ExtractedCode)
+                if valid_only:
+                    query = query.filter_by(is_valid=True)
+                rows = query.order_by(ExtractedCode.extracted_at.desc()).limit(limit).all()
+                return [
+                    {
+                        'code': r.code,
+                        'entropy': r.entropy,
+                        'pattern_score': r.pattern_score,
+                        'confidence': r.ocr_confidence,
+                        'extracted_at': r.extracted_at.isoformat() if r.extracted_at else None,
+                    }
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error("Error listing codes: %s: %s", type(e).__name__, e)
             return []
 
-    # ============================================================================
-    # METRIC LOGGING
-    # ============================================================================
+    def count_codes(self) -> int:
+        try:
+            with self._session() as db:
+                return db.query(ExtractedCode).count()
+        except SQLAlchemyError:
+            return 0
+
+    def count_messages(self) -> int:
+        try:
+            with self._session() as db:
+                return db.query(TelegramMessage).count()
+        except SQLAlchemyError:
+            return 0
+
+    # ------------------------------------------------------------------
+    # Metrics and audit log
+    # ------------------------------------------------------------------
 
     def log_metric(self, metric_name: str, metric_value: float, tags: Dict = None) -> bool:
-        """Log system metric for monitoring"""
         try:
-            metric = SystemMetric(
-                metric_name=metric_name,
-                metric_value=metric_value,
-                tags=tags or {}
-            )
-            self.db.add(metric)
-            self.db.commit()
+            with self._session() as db:
+                db.add(SystemMetric(
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                    tags=tags or {},
+                ))
             return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error logging metric: {type(e).__name__}: {e}")
+        except SQLAlchemyError as e:
+            logger.error("Error logging metric: %s: %s", type(e).__name__, e)
             return False
 
     def log_event(self, level: str, component: str, message: str, context: Dict = None) -> bool:
-        """Log system event for audit trail"""
         try:
-            log = SystemLog(
-                level=level,
-                component=component,
-                message=message,
-                context=context or {}
-            )
-            self.db.add(log)
-            self.db.commit()
+            with self._session() as db:
+                db.add(SystemLog(
+                    level=level,
+                    component=component,
+                    message=message,
+                    context=context or {},
+                ))
             return True
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error logging event: {type(e).__name__}: {e}")
+        except SQLAlchemyError as e:
+            logger.error("Error logging event: %s: %s", type(e).__name__, e)
             return False
 
+    def get_logs(self, limit: int = 20, level: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            with self._session() as db:
+                query = db.query(SystemLog)
+                if level:
+                    query = query.filter_by(level=level)
+                rows = query.order_by(SystemLog.timestamp.desc()).limit(limit).all()
+                return [
+                    {
+                        'timestamp': r.timestamp.isoformat() if r.timestamp else None,
+                        'level': r.level,
+                        'component': r.component,
+                        'message': r.message,
+                    }
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error("Error listing logs: %s: %s", type(e).__name__, e)
+            return []
+
     def cleanup_old_metrics(self, days: int = 7) -> int:
-        """Delete metrics older than N days"""
         try:
             cutoff = datetime.utcnow() - timedelta(days=days)
-            deleted = self.db.query(SystemMetric).filter(
-                SystemMetric.timestamp < cutoff
-            ).delete()
-            self.db.commit()
-            logger.info(f"✓ Cleaned up {deleted} old metrics")
+            with self._session() as db:
+                deleted = db.query(SystemMetric).filter(SystemMetric.timestamp < cutoff).delete()
+            logger.info("Cleaned up %s old metrics", deleted)
             return deleted
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Error cleaning metrics: {type(e).__name__}: {e}")
+        except SQLAlchemyError as e:
+            logger.error("Error cleaning metrics: %s: %s", type(e).__name__, e)
             return 0
 
-    def close(self):
-        """Close database connection"""
+    def health_check(self) -> bool:
+        """True when the database answers a trivial query."""
         try:
-            self.db.close()
-            logger.info("✓ Database connection closed")
-        except Exception as e:
-            logger.error(f"Error closing database: {e}")
+            with self._session() as db:
+                db.query(TelegramSession).limit(1).all()
+            return True
+        except SQLAlchemyError as e:
+            logger.error("Database health check failed: %s: %s", type(e).__name__, e)
+            return False
 
-# Singleton instance
-_persistence_manager = None
+    def close(self):
+        """No-op: sessions are per-operation and already closed."""
+        return None
+
+
+_persistence_manager: Optional[PersistenceManager] = None
+
 
 def get_persistence() -> PersistenceManager:
-    """Get or create persistence manager singleton"""
     global _persistence_manager
     if _persistence_manager is None:
         _persistence_manager = PersistenceManager()

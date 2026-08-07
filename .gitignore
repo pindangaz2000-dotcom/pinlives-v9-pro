@@ -64,3 +64,4 @@ tmp/
 temp/
 *.tmp
 *.bak
+.venv/
