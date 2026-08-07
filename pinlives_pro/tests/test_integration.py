@@ -586,3 +586,51 @@ def test_site_routing_falls_back_without_site():
 def test_site_routing_survives_unknown_site():
     from pinlives_pro.api.backend import extract_codes_for_text
     assert isinstance(extract_codes_for_text('Code AB7X9Q2M', 'no_such_site'), list)
+
+
+# ----------------------------------------------------------------------
+# OCR preprocessing and glyph confusion
+# ----------------------------------------------------------------------
+
+def test_confusion_candidates_reach_the_true_reading():
+    """Measured case: `yNbEB7eSNa` is read as `yNbEBTeSNa`, one glyph off."""
+    from pinlives_pro.core.ocr import confusion_candidates
+    assert 'yNbEB7eSNa' in confusion_candidates('yNbEBTeSNa', max_swaps=1)
+
+
+def test_confusion_candidates_exclude_the_input():
+    from pinlives_pro.core.ocr import confusion_candidates
+    assert 'yNbEBTeSNa' not in confusion_candidates('yNbEBTeSNa', max_swaps=1)
+
+
+def test_confusion_candidates_are_bounded():
+    from pinlives_pro.core.ocr import confusion_candidates
+    # No confusable glyphs means nothing to try.
+    assert confusion_candidates('wxyzwxyz', max_swaps=2) == []
+
+
+def test_strikethrough_restoration_rebuilds_crossed_strokes():
+    """A rule crossing a glyph must not punch a hole through it."""
+    import numpy as np
+    from pinlives_pro.core.ocr import preprocess_screenshot
+
+    # White vertical bar on black, with a red horizontal rule across its middle.
+    img = np.zeros((40, 40, 3), np.uint8)
+    img[5:35, 18:23] = (255, 255, 255)
+    img[19:22, :] = (0, 0, 220)          # BGR red
+
+    out = preprocess_screenshot(img, binarize_threshold=125, scale=1)
+
+    # The bar survives where the rule crossed it, because text sits above and below.
+    assert out[20, 20] == 255
+    # Away from the bar the rule is erased, not left as a line.
+    assert out[20, 2] == 0
+
+
+def test_preprocess_returns_binary_image():
+    import numpy as np
+    from pinlives_pro.core.ocr import preprocess_screenshot
+    img = np.full((20, 20, 3), 200, np.uint8)
+    out = preprocess_screenshot(img, scale=2)
+    assert out.shape[:2] == (40, 40)
+    assert set(np.unique(out)) <= {0, 255}
