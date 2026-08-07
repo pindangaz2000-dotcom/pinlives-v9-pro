@@ -712,3 +712,43 @@ async def test_ocr_failure_does_not_lose_the_message(authed_store, monkeypatch):
     assert authed_store.count_messages() == 1
     assert 'AB7X9Q2M' in [c['code'] for c in authed_store.get_codes()]
     backend_module.persistence = None
+
+
+# ----------------------------------------------------------------------
+# Session import utility (offline conversion, no network, no key exposure)
+# ----------------------------------------------------------------------
+
+def test_import_session_round_trips(tmp_path):
+    """A file session converts to a StringSession the system can restore."""
+    from telethon.sessions import SQLiteSession, StringSession
+    from telethon.crypto import AuthKey
+    from pinlives_pro.tools.import_session import convert_to_string_session
+
+    # Build a synthetic authenticated file session — no real credential.
+    src = tmp_path / 'acct.session'
+    s = SQLiteSession(str(src.with_suffix('')))
+    s.set_dc(2, '149.154.167.40', 443)
+    # A non-degenerate key: an all-zero key is treated as "no key".
+    s.auth_key = AuthKey(data=os.urandom(256))
+    s.save()
+
+    string_session = convert_to_string_session(str(src))
+    decoded = StringSession(string_session)
+    assert decoded.dc_id == 2
+    assert decoded.auth_key is not None and len(decoded.auth_key.key) == 256
+
+
+def test_import_session_rejects_unauthenticated(tmp_path):
+    from telethon.sessions import SQLiteSession
+    from pinlives_pro.tools.import_session import convert_to_string_session
+
+    src = tmp_path / 'empty.session'
+    SQLiteSession(str(src.with_suffix(''))).save()  # no auth_key
+    with pytest.raises(ValueError):
+        convert_to_string_session(str(src))
+
+
+def test_import_session_missing_file():
+    from pinlives_pro.tools.import_session import convert_to_string_session
+    with pytest.raises(FileNotFoundError):
+        convert_to_string_session('/no/such/file.session')
