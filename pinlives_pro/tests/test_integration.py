@@ -175,8 +175,14 @@ async def test_offline_seed_is_idempotent(authed_store):
 # kjc_shared routing
 # ----------------------------------------------------------------------
 
+# A real KJC_THETHAO post: trap-obfuscated codes, tagged with every KJC site.
+KJC_THETHAO_POST = ("⚡️⚡️⚡️⚡️⚡️🤭😨:  J7#2L+IS ➡️ SX?79$SL\n"
+                    "#kjc #lienminhquoctekjc #rr88 #mm88 #xx88 #gg88 #LLwin #thethao")
+
+
 def test_detect_kjc_site_from_text():
     from pinlives_pro.core.kjc_routing import detect_kjc_site_from_text
+    # Exactly one site named -> that site.
     assert detect_kjc_site_from_text('MM88 code 7hK2mQ') == 'mm88'
     assert detect_kjc_site_from_text('phat code RR88 hom nay') == 'rr88'
     assert detect_kjc_site_from_text('LLWIN B37MM9') == 'llwin'
@@ -184,6 +190,8 @@ def test_detect_kjc_site_from_text():
     assert detect_kjc_site_from_text('GG88 tang ma') == 'gg88'
     assert detect_kjc_site_from_text('code chung khong site') is None
     assert detect_kjc_site_from_text('') is None
+    # Several sites named (a broadcast post) -> None, not "first marker wins".
+    assert detect_kjc_site_from_text(KJC_THETHAO_POST) is None
 
 
 def test_resolve_sites():
@@ -192,9 +200,21 @@ def test_resolve_sites():
     assert resolve_sites('kjc_shared', 'MM88 code 7hK2mQ') == ['mm88']
     # No marker -> all five KJC sites, in order.
     assert resolve_sites('kjc_shared', 'code chung 7hK2mQ') == list(KJC_SITES)
+    # Every KJC site tagged (broadcast) -> all five, not just the first.
+    assert resolve_sites('kjc_shared', KJC_THETHAO_POST) == list(KJC_SITES)
     # A normal site resolves to itself; an empty site to nothing (generic later).
     assert resolve_sites('c168', 'anything') == ['c168']
     assert resolve_sites('', 'anything') == []
+
+
+def test_kjc_thethao_post_extracts_trap_codes_and_broadcasts():
+    """A real KJC_THETHAO post: the trap symbols are stripped to 6-char codes,
+    and the all-site tags route it to every KJC site."""
+    from pinlives_pro.api.backend import extract_codes_for_text
+    from pinlives_pro.core.kjc_routing import resolve_sites, KJC_SITES
+    assert resolve_sites('kjc_shared', KJC_THETHAO_POST) == list(KJC_SITES)
+    codes = extract_codes_for_text(KJC_THETHAO_POST, 'kjc_shared')
+    assert codes == ['J72LIS', 'SX79SL']
 
 
 def test_kjc_shared_extraction_routes_by_marker():

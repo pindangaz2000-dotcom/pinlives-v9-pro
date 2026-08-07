@@ -1,54 +1,59 @@
 """Routing for kjc_shared aggregate channels.
 
-A kjc_shared channel (kjc_gaixinh2, kjc_fifa_worldcup, stthaymoingay) posts
-codes for several KJC sites at once. v9.5's listener picked the concrete site
-from a marker in the post ("MM88", "RR88", ...) and, when no marker was present,
-treated the code as valid for all five. This reproduces that resolution so the
-correct per-site validator runs instead of the generic filter.
+A kjc_shared channel (kjc_gaixinh2, kjc_thethao, kjc_fifa_worldcup,
+stthaymoingay) posts codes for several KJC sites at once. Which site a post
+targets is read from the site markers in its text:
 
-The channel's stored site stays 'kjc_shared'; resolution happens at extraction
-time from the post text. Keeping it that way means a journal replay re-runs the
-exact same routing rather than a frozen guess.
+  * exactly one KJC site named  -> that site;
+  * several sites named, or none -> all five (the code is a shared KJC code,
+    valid across rr88/mm88/xx88/gg88/llwin).
+
+Real KJC_THETHAO posts tag every KJC site (#rr88 #mm88 #xx88 #gg88 #LLwin), so
+"first marker wins" would mis-route the whole channel to one site; counting the
+distinct sites named is what makes an all-sites broadcast resolve to all five.
+
+The channel's stored site stays 'kjc_shared'; resolution happens from the post
+text each time, so a journal replay re-runs the exact same routing.
 """
 
 from typing import List, Optional
 
 KJC_SHARED = 'kjc_shared'
 
-# The sites a kjc_shared post can target, and the order used when no marker is
-# present (a code is then treated as valid for all of them).
+# The sites a kjc_shared post can target, and the order used when a code is
+# treated as valid for all of them.
 KJC_SITES = ('rr88', 'mm88', 'xx88', 'gg88', 'llwin')
 
-# Marker → site, in v9.5's precedence order. First marker found in the post wins.
-_MARKERS = (
-    ('MM88', 'mm88'),
-    ('RR88', 'rr88'),
-    ('LLWIN', 'llwin'),
-    ('XX88', 'xx88'),
-    ('GG88', 'gg88'),
-)
+
+def kjc_sites_in_text(text: str) -> List[str]:
+    """The KJC sites named in the post, in KJC_SITES order, de-duplicated."""
+    if not text:
+        return []
+    upper = text.upper()
+    return [site for site in KJC_SITES if site.upper() in upper]
 
 
 def detect_kjc_site_from_text(text: str) -> Optional[str]:
-    """The concrete KJC site named in the post, or None when none is named."""
-    if not text:
-        return None
-    upper = text.upper()
-    for marker, site in _MARKERS:
-        if marker in upper:
-            return site
-    return None
+    """The single KJC site a post targets, or None when it names several or none.
+
+    None is not "no site" — for a kjc_shared post it means the code is shared
+    across all five KJC sites (see resolve_sites).
+    """
+    named = kjc_sites_in_text(text)
+    return named[0] if len(named) == 1 else None
 
 
 def resolve_sites(site_id: Optional[str], text: str) -> List[str]:
     """Concrete site(s) a message's codes belong to.
 
-    A normal site resolves to itself. A kjc_shared channel resolves to the one
-    site named in the post, or to all five KJC sites when none is named. An
-    empty site resolves to no site (the caller then uses the generic filter).
+    A normal site resolves to itself. A kjc_shared post resolves to the one site
+    it names, or to all five KJC sites when it names several or none. An empty
+    site resolves to no site (the caller then uses the generic filter).
     """
     site = (site_id or '').strip().lower()
     if site != KJC_SHARED:
         return [site] if site else []
-    detected = detect_kjc_site_from_text(text)
-    return [detected] if detected else list(KJC_SITES)
+    named = kjc_sites_in_text(text)
+    if len(named) == 1:
+        return named
+    return list(KJC_SITES)
