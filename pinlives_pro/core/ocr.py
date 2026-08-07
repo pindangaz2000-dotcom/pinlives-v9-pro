@@ -54,6 +54,15 @@ MIN_WORD_CONF = 30.0
 import os as _os
 VARIANT_TIMEOUT_S = float(_os.environ.get('OCR_VARIANT_TIMEOUT_S', '15'))
 
+# Latency levers learned from an on-device (Lens-style) image pipeline and then
+# measured here, not assumed:
+#   - the code banners are horizontal, so the angle-classifier model is a wasted
+#     pass — dropping it cut ~25% of latency with no accuracy change;
+#   - processing at the smallest sufficient resolution trims more; only oversized
+#     images are shrunk, so the multi-code posts keep their small glyphs.
+# (Raising onnx thread count was also tried and *rejected* — it was slower here.)
+OCR_MAX_SIDE = int(_os.environ.get('OCR_MAX_SIDE', '1600'))
+
 
 def _config(psm: int) -> str:
     return f'--oem 1 --psm {psm} -c tessedit_char_whitelist={_WHITELIST}'
@@ -320,6 +329,16 @@ class GiftcodeOCR:
     def backend(self) -> str:
         return 'rapidocr-ppocrv4' if self._rapid is not None else 'tesseract'
 
+    @staticmethod
+    def _cap_resolution(img: np.ndarray) -> np.ndarray:
+        """Shrink only oversized images to the smallest sufficient side length."""
+        h, w = img.shape[:2]
+        longest = max(h, w)
+        if longest <= OCR_MAX_SIDE:
+            return img
+        s = OCR_MAX_SIDE / longest
+        return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+
     def _rapid_words(self, img: np.ndarray) -> List[Tuple[str, float]]:
         """(token, confidence 0-100) for every alnum word PP-OCRv4 detects.
 
@@ -328,7 +347,12 @@ class GiftcodeOCR:
         site validator picks the real code out of them.
         """
         try:
-            result, _ = self._rapid(img)
+            # use_cls=False skips the horizontal/vertical classifier — these
+            # banners are horizontal, so it only adds latency.
+            result, _ = self._rapid(self._cap_resolution(img), use_cls=False)
+        except TypeError:
+            # An older RapidOCR without the per-call toggle.
+            result, _ = self._rapid(self._cap_resolution(img))
         except Exception as e:
             logger.warning("RapidOCR failed: %s: %s", type(e).__name__, e)
             return []

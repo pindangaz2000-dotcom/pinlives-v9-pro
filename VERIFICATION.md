@@ -307,3 +307,31 @@ site validator (not a known-code set) gates the confusion candidates. The
 recovery layer is only as safe as that validator — a loose site filter could
 confirm a wrong confusion variant, which is the reason OCR output stays
 review-only.
+
+---
+
+## Update: latency principle learned from an on-device (Lens-style) pipeline
+
+An uploaded Android native library (`com.google.android.libraries.oliveoil`,
+aarch64 JNI, Halide-accelerated YuvToRgb) could not be used directly — wrong
+architecture, wrong platform, and it contains only colour-space conversion, no
+text extraction (verified: sole image op is `nativeHalideYuvToRgb8888`, `.rodata`
+4.6 KB, no model). But the *principle* behind its low latency transfers: fuse or
+drop unneeded stages, and process at the smallest sufficient resolution.
+
+Applied to the RapidOCR path and measured on the ten real posts:
+
+| Config | latency | accuracy |
+|---|---|---|
+| baseline (det + cls + rec, full res) | 899 ms | unchanged |
+| drop the angle-classifier (use_cls=False) | 670 ms (−25%) | unchanged |
+| + cap oversized images | 637 ms (−29%) | unchanged |
+| raise onnx threads to 4 | 844 ms (**worse**) | unchanged |
+
+The banners are horizontal, so the angle-classifier model was a wasted pass —
+dropping it is the clean win. Capping resolution trims oversized uploads without
+touching the multi-code posts. Raising the thread count was **measured and
+rejected** — it was slower on this host, so it was not applied.
+
+Integrated engine after tuning: 6/9 exact recovery preserved, mean latency
+~600 ms (from ~720–900 ms). `OCR_MAX_SIDE` bounds the resolution cap.
