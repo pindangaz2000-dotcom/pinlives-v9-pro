@@ -12,6 +12,7 @@ from typing import Optional
 # site -> (min_len, max_len), inclusive.
 SITE_CODE_LENGTHS = {
     'qq88': (10, 10),   # exactly 10 (v9.5 is_clean_code; live cMoC1cCsy3)
+    '8kbet': (8, 8),    # exactly 8, a-zA-Z0-9 (operator spec; live image codes)
     'rr88': (6, 6),     # KJC sites: exactly 6 (v9.5 health KJC666; live J72LIS…)
     'mm88': (6, 6),
     'xx88': (6, 6),

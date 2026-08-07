@@ -246,6 +246,10 @@ def test_site_length_rule():
     assert passes_length('qq88', 'cMoC1cCsy3') is True     # 10
     assert passes_length('qq88', 'Please') is False        # 6
     assert passes_length('qq88', 'cMoC1cCsy3X') is False   # 11
+    # 8kbet codes are exactly 8 (a-zA-Z0-9).
+    assert passes_length('8kbet', 'vO7QiiX9') is True      # 8
+    assert passes_length('8kbet', 'vO7QiiX') is False      # 7
+    assert passes_length('8kbet', 'vO7QiiX99') is False    # 9
     # KJC sites are exactly 6.
     assert passes_length('mm88', 'J72LIS') is True         # 6
     assert passes_length('mm88', 'J72LI') is False         # 5
