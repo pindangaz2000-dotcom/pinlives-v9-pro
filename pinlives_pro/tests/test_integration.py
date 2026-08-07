@@ -136,7 +136,7 @@ def test_channel_seed_file_is_valid():
     from pinlives_pro.tools.seed_channels import load_seed
     entries = load_seed()
     # Every entry carries a site and a way to identify the channel.
-    assert len(entries) == 32
+    assert len(entries) == 33
     for e in entries:
         assert e.get('site'), e
         assert ('channel_id' in e) or e.get('username'), e
@@ -155,7 +155,7 @@ async def test_offline_seed_adds_numeric_entries_only(authed_store):
     from pinlives_pro.tools.seed_channels import seed
     tally = await seed(offline=True, dry_run=False)
     assert tally.get('added') == 1
-    assert tally.get('skipped_offline') == 31
+    assert tally.get('skipped_offline') == 32
     stored = authed_store.get_channels(PHONE)
     assert [(c['channel_id'], c['site_id']) for c in stored] == [(-1002272716520, 'qq88')]
 
@@ -169,6 +169,51 @@ async def test_offline_seed_is_idempotent(authed_store):
     assert tally.get('added', 0) == 0
     assert tally.get('already') == 1
     assert len(authed_store.get_channels(PHONE)) == 1
+
+
+# ----------------------------------------------------------------------
+# kjc_shared routing
+# ----------------------------------------------------------------------
+
+def test_detect_kjc_site_from_text():
+    from pinlives_pro.core.kjc_routing import detect_kjc_site_from_text
+    assert detect_kjc_site_from_text('MM88 code 7hK2mQ') == 'mm88'
+    assert detect_kjc_site_from_text('phat code RR88 hom nay') == 'rr88'
+    assert detect_kjc_site_from_text('LLWIN B37MM9') == 'llwin'
+    assert detect_kjc_site_from_text('XX88 esport') == 'xx88'
+    assert detect_kjc_site_from_text('GG88 tang ma') == 'gg88'
+    assert detect_kjc_site_from_text('code chung khong site') is None
+    assert detect_kjc_site_from_text('') is None
+
+
+def test_resolve_sites():
+    from pinlives_pro.core.kjc_routing import resolve_sites, KJC_SITES
+    # A kjc_shared post names one site -> just that site.
+    assert resolve_sites('kjc_shared', 'MM88 code 7hK2mQ') == ['mm88']
+    # No marker -> all five KJC sites, in order.
+    assert resolve_sites('kjc_shared', 'code chung 7hK2mQ') == list(KJC_SITES)
+    # A normal site resolves to itself; an empty site to nothing (generic later).
+    assert resolve_sites('c168', 'anything') == ['c168']
+    assert resolve_sites('', 'anything') == []
+
+
+def test_kjc_shared_extraction_routes_by_marker():
+    """A kjc_shared post with a site marker runs that site's extractor."""
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert extract_codes_for_text('MM88 code 7hK2mQ nhan ngay', 'kjc_shared') == ['7hK2mQ']
+
+
+def test_kjc_shared_extraction_unions_when_no_marker():
+    """Without a marker the code is valid for all five KJC sites; it is still
+    extracted (unioned across them, de-duplicated)."""
+    from pinlives_pro.api.backend import extract_codes_for_text
+    codes = extract_codes_for_text('Code chung A9bQ2Z dung duoc het', 'kjc_shared')
+    assert codes == ['A9bQ2Z']
+
+
+def test_kjc_shared_does_not_change_normal_site_routing():
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert extract_codes_for_text('HI88 ma uRCzuDA8Z7', 'hi88') == ['uRCzuDA8Z7']
 
 
 # ----------------------------------------------------------------------

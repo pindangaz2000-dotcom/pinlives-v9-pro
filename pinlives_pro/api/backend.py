@@ -26,6 +26,7 @@ from ..core.persistence import get_persistence
 from ..core.codefilter import extract_codes, shannon_entropy
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from ..core.filters import extract_codes_for_site
+from ..core.kjc_routing import resolve_sites
 from ..core.config import get_settings
 from ..core.logging_setup import setup_logging
 from ..core.telethon_client import TelethonService, TelethonError
@@ -573,15 +574,30 @@ def _ocr_blocking(media_path: str, site_id: Optional[str]) -> List[tuple]:
 
 
 def extract_codes_for_text(text: str, site_id: Optional[str]) -> List[str]:
-    """Route to the site's extractor, falling back to the generic filter."""
+    """Route to the site's extractor, falling back to the generic filter.
+
+    A kjc_shared channel expands to the concrete KJC site(s) its post targets:
+    the one named in the text, or all five when none is named. Codes are unioned
+    across those sites (they share the KJC format) and de-duplicated in order.
+    """
     if not text:
         return []
-    if site_id:
+    sites = resolve_sites(site_id, text)
+    if not sites:
+        return extract_codes(text)
+    out: List[str] = []
+    seen = set()
+    for site in sites:
         try:
-            return extract_codes_for_site(text, site_id, source='text')
+            found = extract_codes_for_site(text, site, source='text')
         except Exception as e:
-            logger.error("Site extractor %s failed: %s: %s", site_id, type(e).__name__, e)
-    return extract_codes(text)
+            logger.error("Site extractor %s failed: %s: %s", site, type(e).__name__, e)
+            continue
+        for c in found:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+    return out
 
 # ============================================================================
 # HEALTH CHECK & MONITORING ENDPOINTS
