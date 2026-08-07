@@ -310,7 +310,7 @@ def test_image_only_ocr_skips_confusion_expansion(monkeypatch):
     import pinlives_pro.core.ocr as ocrmod
 
     class _FakeOCR:
-        def extract(self, path, validator=None, max_codes=50):
+        def extract(self, path, validator=None, max_codes=50, image_only=False):
             return ocrmod.OCRResult([ocrmod.OCRCode('GItRSjD0', 1, 98.7, ['f'])], 1.0, 1)
 
     monkeypatch.setattr(ocrmod, 'get_ocr', lambda: _FakeOCR())
@@ -324,6 +324,21 @@ def test_image_only_ocr_skips_confusion_expansion(monkeypatch):
     normal = b._ocr_blocking('x', 'hi88')
     assert ('GItRSjD0', 98.7) in normal
     assert 'GItRSjDO' in [c for c, _ in normal]
+
+
+def test_image_only_regions_shapes():
+    """The image-only preprocessing yields a grayscale full frame plus a
+    two-column crop (left 30% + right 30%); a narrow image gets the frame only."""
+    import numpy as np
+    from pinlives_pro.core.ocr import GiftcodeOCR
+    img = np.zeros((100, 400, 3), dtype=np.uint8)
+    regions = GiftcodeOCR._image_only_regions(img)
+    assert len(regions) == 2
+    full, cols = regions
+    assert full.shape == (100, 400, 3)   # grayscale re-expanded to 3 channels
+    assert cols.shape == (100, 240, 3)   # 120px left + 120px right
+    # Too narrow for side columns -> just the full frame.
+    assert len(GiftcodeOCR._image_only_regions(np.zeros((50, 150, 3), np.uint8))) == 1
 
 
 # ----------------------------------------------------------------------

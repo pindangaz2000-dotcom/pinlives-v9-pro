@@ -549,7 +549,7 @@ def _ocr_blocking(media_path: str, site_id: Optional[str]) -> List[tuple]:
         return bool(extract_codes(token))
 
     ocr = get_ocr()
-    result = ocr.extract(media_path, validator=accepts)
+    result = ocr.extract(media_path, validator=accepts, image_only=is_image_only(site_id))
 
     # For an image-only site (8KBET) the validator accepts almost any code-shaped
     # token, so expanding each read into confusable-glyph variants floods the
