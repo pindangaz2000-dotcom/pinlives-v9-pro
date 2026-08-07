@@ -136,6 +136,54 @@ class ExtractedCode(Base):
 
     message = relationship("TelegramMessage", back_populates="codes")
 
+class Provenance:
+    """Where a record came from. Production results must be REAL.
+
+    Without this, a replayed or hand-entered record is indistinguishable from a
+    live capture, and a dashboard can read healthy while real ingestion is dead.
+    """
+    REAL = 'REAL'            # captured live from Telegram
+    REPLAY = 'REPLAY'        # re-processed from the journal
+    BACKFILL = 'BACKFILL'    # pulled from channel history
+    MANUAL = 'MANUAL'        # entered by an operator
+    SIMULATED = 'SIMULATED'  # synthetic, for tests
+
+    ALL = (REAL, REPLAY, BACKFILL, MANUAL, SIMULATED)
+
+
+class EventJournal(Base):
+    """Immutable record of every event received, written before processing.
+
+    Journaling first means a slow or broken extractor cannot lose a post, and
+    that a new OCR or filter can be measured by replaying real traffic instead
+    of waiting for channels to post again.
+    """
+    __tablename__ = "event_journal"
+    __table_args__ = (
+        UniqueConstraint('chat_id', 'message_id', name='uq_journal_event'),
+        Index('idx_journal_received_at', 'received_at'),
+        Index('idx_journal_chat', 'chat_id'),
+        Index('idx_journal_provenance', 'provenance'),
+        Index('idx_journal_processed', 'processed'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String(20), nullable=False)
+    chat_id = Column(BigInteger, nullable=False)
+    chat_name = Column(String(255), nullable=True)
+    message_id = Column(BigInteger, nullable=False)
+    site_id = Column(String(32), nullable=False, default='')
+    text = Column(Text, nullable=True)
+    has_media = Column(Boolean, default=False)
+    media_path = Column(String(500), nullable=True)
+    posted_at = Column(DateTime, nullable=True)
+    received_at = Column(DateTime, default=datetime.utcnow)
+    provenance = Column(String(16), nullable=False, default=Provenance.REAL)
+    processed = Column(Boolean, default=False)
+    # Milliseconds from journal write to extraction finishing.
+    process_ms = Column(Float, nullable=True)
+
+
 class SystemMetric(Base):
     """System performance metrics for monitoring"""
     __tablename__ = "system_metrics"

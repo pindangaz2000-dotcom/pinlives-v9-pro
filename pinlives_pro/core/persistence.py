@@ -8,6 +8,7 @@ handlers and the background message processor at the same time.
 
 import hashlib
 import logging
+import math
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -15,8 +16,10 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ..models.database import (
+    EventJournal,
     ExtractedCode,
     MonitoredChannel,
+    Provenance,
     SessionLocal,
     SystemLog,
     SystemMetric,
@@ -172,6 +175,119 @@ class PersistenceManager:
         except SQLAlchemyError as e:
             logger.error("Error reading channel site: %s: %s", type(e).__name__, e)
             return ''
+
+    # ------------------------------------------------------------------
+    # Event journal
+    # ------------------------------------------------------------------
+
+    def journal_event(self, payload: Dict[str, Any],
+                      provenance: str = Provenance.REAL) -> Optional[int]:
+        """Record an incoming event before anything processes it.
+
+        Returns the journal row id, or the existing id when this event was
+        already recorded. None means the write failed.
+        """
+        try:
+            with self._session() as db:
+                existing = db.query(EventJournal).filter_by(
+                    chat_id=payload.get('chat_id'),
+                    message_id=payload.get('message_id'),
+                ).first()
+                if existing:
+                    return existing.id
+
+                posted = payload.get('date')
+                posted_at = None
+                if posted:
+                    try:
+                        posted_at = datetime.fromisoformat(str(posted).replace('Z', '+00:00'))
+                        if posted_at.tzinfo is not None:
+                            posted_at = posted_at.replace(tzinfo=None)
+                    except ValueError:
+                        posted_at = None
+
+                row = EventJournal(
+                    phone=payload.get('phone') or '',
+                    chat_id=payload.get('chat_id'),
+                    chat_name=payload.get('chat_name'),
+                    message_id=payload.get('message_id'),
+                    site_id=(payload.get('site_id') or '').lower(),
+                    text=payload.get('text'),
+                    has_media=bool(payload.get('has_media')),
+                    media_path=payload.get('media_path'),
+                    posted_at=posted_at,
+                    provenance=provenance,
+                )
+                db.add(row)
+                db.flush()
+                return row.id
+        except IntegrityError:
+            return None
+        except SQLAlchemyError as e:
+            logger.error("Error journalling event: %s: %s", type(e).__name__, e)
+            return None
+
+    def mark_journal_processed(self, journal_id: int, process_ms: float) -> bool:
+        try:
+            with self._session() as db:
+                row = db.query(EventJournal).filter_by(id=journal_id).first()
+                if row is None:
+                    return False
+                row.processed = True
+                row.process_ms = process_ms
+            return True
+        except SQLAlchemyError as e:
+            logger.error("Error updating journal: %s: %s", type(e).__name__, e)
+            return False
+
+    def get_journal(self, limit: int = 100, chat_id: Optional[int] = None,
+                    provenance: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Recorded events, newest first. The source for replay."""
+        try:
+            with self._session() as db:
+                q = db.query(EventJournal)
+                if chat_id is not None:
+                    q = q.filter_by(chat_id=chat_id)
+                if provenance:
+                    q = q.filter_by(provenance=provenance)
+                rows = q.order_by(EventJournal.received_at.desc()).limit(limit).all()
+                return [
+                    {
+                        'id': r.id,
+                        'phone': r.phone,
+                        'chat_id': r.chat_id,
+                        'chat_name': r.chat_name,
+                        'message_id': r.message_id,
+                        'site_id': r.site_id,
+                        'text': r.text,
+                        'has_media': r.has_media,
+                        'media_path': r.media_path,
+                        'provenance': r.provenance,
+                        'processed': r.processed,
+                        'process_ms': r.process_ms,
+                        'received_at': r.received_at.isoformat() if r.received_at else None,
+                    }
+                    for r in rows
+                ]
+        except SQLAlchemyError as e:
+            logger.error("Error reading journal: %s: %s", type(e).__name__, e)
+            return []
+
+    def journal_stats(self) -> Dict[str, Any]:
+        """Counts by provenance, plus processing-latency percentiles."""
+        try:
+            with self._session() as db:
+                by_prov = {}
+                for prov in Provenance.ALL:
+                    by_prov[prov] = db.query(EventJournal).filter_by(provenance=prov).count()
+                durations = [
+                    r[0] for r in db.query(EventJournal.process_ms)
+                    .filter(EventJournal.process_ms.isnot(None)).all()
+                ]
+            return {'by_provenance': by_prov, 'latency_ms': _percentiles(durations)}
+        except SQLAlchemyError as e:
+            logger.error("Error reading journal stats: %s: %s", type(e).__name__, e)
+            return {'by_provenance': {}, 'latency_ms': {}}
 
     # ------------------------------------------------------------------
     # Messages
@@ -444,3 +560,24 @@ def get_persistence() -> PersistenceManager:
     if _persistence_manager is None:
         _persistence_manager = PersistenceManager()
     return _persistence_manager
+
+
+def _percentiles(values: List[float]) -> Dict[str, Any]:
+    """p50/p95/p99 over processing durations. Counts alone hide tail latency."""
+    if not values:
+        return {'count': 0}
+    ordered = sorted(values)
+
+    def pick(p: float) -> float:
+        # Nearest-rank: ceil(p * n) - 1. Interpolating over (n-1) shifts the
+        # median up by one sample, reporting a worse p50 than reality.
+        idx = max(0, min(math.ceil(p * len(ordered)) - 1, len(ordered) - 1))
+        return round(ordered[idx], 2)
+
+    return {
+        'count': len(ordered),
+        'p50': pick(0.50),
+        'p95': pick(0.95),
+        'p99': pick(0.99),
+        'max': round(ordered[-1], 2),
+    }

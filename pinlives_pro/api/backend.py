@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, validator
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 import logging
+import os
 import re
 import time
 import json
@@ -20,9 +21,10 @@ import asyncio
 import aiohttp
 from functools import wraps
 
-from ..models.database import init_db
+from ..models.database import init_db, Provenance
 from ..core.persistence import get_persistence
 from ..core.codefilter import extract_codes, shannon_entropy
+from ..core.filters import extract_codes_for_site
 from ..core.config import get_settings
 from ..core.logging_setup import setup_logging
 from ..core.telethon_client import TelethonService, TelethonError
@@ -176,6 +178,34 @@ class SystemMonitor:
             'percent': disk.percent
         }
 
+def _build_identity() -> Dict[str, Any]:
+    """Identify the running code so a screenshot maps to a commit.
+
+    Several versions of this system have existed side by side; without this a
+    bug report cannot be tied to the code that produced it.
+    """
+    import subprocess
+    sha = os.environ.get('GIT_SHA', '')
+    if not sha:
+        try:
+            sha = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=Path(__file__).resolve().parents[2], stderr=subprocess.DEVNULL, timeout=5,
+            ).decode().strip()
+        except Exception:
+            sha = 'unknown'
+    return {
+        'version': '3.1',
+        'git_sha': sha,
+        'schema_version': SCHEMA_VERSION,
+        'environment': os.environ.get('ENVIRONMENT', 'development'),
+        'started_at': datetime.utcnow().isoformat(),
+    }
+
+
+SCHEMA_VERSION = 2
+BUILD = None
+
 # Global instances
 ocr_cache = OCRCache()
 message_queue = MessageQueue()
@@ -205,13 +235,16 @@ def _require_ready() -> None:
 async def startup():
     global persistence, telethon_service
 
+    global BUILD
+    BUILD = _build_identity()
+
     _boot_settings = get_settings()
     setup_logging(
         level=_boot_settings.log_level,
         log_file=_boot_settings.log_file,
         component='pinlives.backend',
     )
-    logger.info("Starting PINLIVES Pro v3.1 backend")
+    logger.info("Starting PINLIVES Pro backend %s", BUILD)
 
     init_db()
     persistence = get_persistence()
@@ -329,13 +362,29 @@ async def message_processor():
             await asyncio.sleep(5)
 
 async def process_message(payload: Dict) -> None:
-    """Persist one message. Raises on failure so the caller can retry."""
+    """Persist one message and extract its codes. Raises so the caller retries."""
     if not persistence:
         raise RuntimeError("Persistence not initialized")
 
     phone = payload.get('phone')
     if not phone:
         raise ValueError("Message payload is missing 'phone'")
+
+    started = time.perf_counter()
+
+    # Resolve the site before journalling: replay reads site_id back from the
+    # journal, so recording it empty would make a replay run a different
+    # extractor than the live pass it is meant to reproduce.
+    site_id = payload.get('site_id')
+    if site_id is None:
+        site_id = persistence.get_channel_site(phone, payload.get('chat_id'))
+    payload = {**payload, 'site_id': site_id}
+
+    # Journal before processing: a slow or broken extractor must not lose the
+    # post, and a recorded event can be replayed to measure a new filter later.
+    journal_id = persistence.journal_event(
+        payload, provenance=payload.get('provenance', Provenance.REAL)
+    )
 
     msg_id = persistence.save_message(
         phone=phone,
@@ -354,15 +403,37 @@ async def process_message(payload: Dict) -> None:
             f"save_message returned no row id for phone={phone} chat={payload.get('chat_id')}"
         )
 
-    text = payload.get('text')
-    if text:
-        for code in extract_codes(text):
-            persistence.save_code(msg_id, code, entropy=shannon_entropy(code))
+    text = payload.get('text') or ''
+    found = extract_codes_for_text(text, site_id)
+    for code in found:
+        persistence.save_code(msg_id, code, entropy=shannon_entropy(code))
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    if journal_id:
+        persistence.mark_journal_processed(journal_id, elapsed_ms)
 
     persistence.log_event(
         'INFO', 'backend', f"Message stored: {payload.get('chat_name')}",
-        {'chat_id': payload.get('chat_id'), 'message_id': payload.get('message_id')},
+        {
+            'chat_id': payload.get('chat_id'),
+            'message_id': payload.get('message_id'),
+            'site_id': site_id,
+            'codes': len(found),
+            'ms': round(elapsed_ms, 1),
+        },
     )
+
+
+def extract_codes_for_text(text: str, site_id: Optional[str]) -> List[str]:
+    """Route to the site's extractor, falling back to the generic filter."""
+    if not text:
+        return []
+    if site_id:
+        try:
+            return extract_codes_for_site(text, site_id, source='text')
+        except Exception as e:
+            logger.error("Site extractor %s failed: %s: %s", site_id, type(e).__name__, e)
+    return extract_codes(text)
 
 # ============================================================================
 # HEALTH CHECK & MONITORING ENDPOINTS
@@ -380,6 +451,7 @@ async def health_check() -> Dict[str, Any]:
 
     return {
         'status': status_value,
+        'build': BUILD or {},
         'timestamp': datetime.utcnow().isoformat(),
         'uptime_seconds': system_monitor.get_uptime(),
         'database': 'connected' if db_ok else 'disconnected',
@@ -399,9 +471,11 @@ async def status() -> Dict[str, Any]:
     """Operational status, including counts read back from the database."""
     stored_messages = persistence.count_messages() if persistence else 0
     stored_codes = persistence.count_codes() if persistence else 0
+    journal = persistence.journal_stats() if persistence else {}
     return {
         'status': 'running',
-        'version': '3.1',
+        'build': BUILD or {},
+        'journal': journal,
         'uptime_seconds': system_monitor.get_uptime(),
         'messages_processed': system_monitor.message_count,
         'messages_stored': stored_messages,
@@ -581,6 +655,105 @@ async def receive_message(payload: MessagePayload):
         'queued': True,
         'queue_depth': message_queue.size(),
     }
+
+# ============================================================================
+# REPLAY & BACKFILL
+# ============================================================================
+
+class ReplayRequest(BaseModel):
+    limit: int = Field(50, ge=1, le=5000)
+    chat_id: Optional[int] = None
+    site_id: Optional[str] = None
+
+
+@app.get("/api/journal")
+async def list_journal(limit: int = 50, chat_id: Optional[int] = None,
+                       provenance: Optional[str] = None):
+    """Recorded events. This is the replay source."""
+    _require_ready()
+    return {'success': True, 'events': persistence.get_journal(limit, chat_id, provenance)}
+
+
+@app.post("/api/replay")
+async def replay(request: ReplayRequest):
+    """Re-run extraction over journalled events and report what changed.
+
+    This is how a filter or OCR change is measured: against real recorded
+    traffic, without waiting for channels to post again. It does not write
+    codes; it reports what the current extractor would find.
+    """
+    _require_ready()
+    events = persistence.get_journal(limit=request.limit, chat_id=request.chat_id)
+
+    started = time.perf_counter()
+    per_event = []
+    durations = []
+    total_codes = 0
+
+    for event in events:
+        site = request.site_id or event.get('site_id') or ''
+        t0 = time.perf_counter()
+        codes = extract_codes_for_text(event.get('text') or '', site)
+        took = (time.perf_counter() - t0) * 1000
+        durations.append(took)
+        total_codes += len(codes)
+        per_event.append({
+            'journal_id': event['id'],
+            'chat_id': event['chat_id'],
+            'message_id': event['message_id'],
+            'site_id': site,
+            'codes': codes,
+            'ms': round(took, 3),
+        })
+
+    from ..core.persistence import _percentiles
+    return {
+        'success': True,
+        'events_replayed': len(events),
+        'codes_found': total_codes,
+        'wall_ms': round((time.perf_counter() - started) * 1000, 1),
+        'per_event_ms': _percentiles(durations),
+        'results': per_event,
+    }
+
+
+class BackfillRequest(BaseModel):
+    chat_id: Optional[int] = None
+    per_channel: int = Field(5, ge=1, le=100)
+
+
+@app.post("/api/backfill")
+async def backfill(request: BackfillRequest):
+    """Pull recent history from configured channels into the journal.
+
+    Gives the pipeline real traffic to be measured against on a fresh install,
+    instead of waiting for the next live post.
+    """
+    _require_ready()
+    if not telethon_service.authenticated:
+        raise HTTPException(status_code=409, detail="Not signed in to Telegram")
+
+    targets = (
+        [request.chat_id] if request.chat_id
+        else sorted(telethon_service.allowed_channels)
+    )
+    if not targets:
+        raise HTTPException(status_code=409, detail="No configured channels")
+
+    summary = []
+    for chat_id in targets:
+        try:
+            fetched = await telethon_service.fetch_history(chat_id, request.per_channel)
+        except TelethonError as e:
+            summary.append({'chat_id': chat_id, 'error': str(e)})
+            continue
+        for payload in fetched:
+            payload['provenance'] = Provenance.BACKFILL
+            await message_queue.enqueue(payload)
+        summary.append({'chat_id': chat_id, 'queued': len(fetched)})
+
+    return {'success': True, 'channels': summary, 'queue_depth': message_queue.size()}
+
 
 # ============================================================================
 # ERROR HANDLERS

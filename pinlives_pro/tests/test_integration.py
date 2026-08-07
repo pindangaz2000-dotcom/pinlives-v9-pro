@@ -521,3 +521,68 @@ def test_channel_site_id_round_trip(authed_store):
     authed_store.add_channel(PHONE, CHANNEL, 'Kenh Kin', site_id='MB66')
     assert authed_store.get_channel_site(PHONE, CHANNEL) == 'mb66'
     assert authed_store.get_channels(PHONE)[0]['site_id'] == 'mb66'
+
+
+# ----------------------------------------------------------------------
+# Event journal, provenance, replay
+# ----------------------------------------------------------------------
+
+def test_journal_records_event_once(store):
+    from pinlives_pro.models.database import Provenance
+    payload = {'phone': PHONE, 'chat_id': CHANNEL, 'chat_name': 'K', 'message_id': 1,
+               'text': 'Ma AB7X9Q2M', 'site_id': 'mb66'}
+    first = store.journal_event(payload, Provenance.REAL)
+    second = store.journal_event(payload, Provenance.REAL)
+    assert isinstance(first, int)
+    # A redelivered update must not create a second journal row.
+    assert second == first
+    assert len(store.get_journal()) == 1
+
+
+def test_journal_records_resolved_site_id(store):
+    """Replay reads site_id back; an empty one would run a different extractor."""
+    store.journal_event({'phone': PHONE, 'chat_id': CHANNEL, 'chat_name': 'K',
+                         'message_id': 2, 'text': 'x', 'site_id': 'MB66'})
+    assert store.get_journal()[0]['site_id'] == 'mb66'
+
+
+def test_journal_provenance_is_tracked(store):
+    from pinlives_pro.models.database import Provenance
+    store.journal_event({'phone': PHONE, 'chat_id': CHANNEL, 'message_id': 3,
+                         'chat_name': 'K', 'text': 'a'}, Provenance.REAL)
+    store.journal_event({'phone': PHONE, 'chat_id': CHANNEL, 'message_id': 4,
+                         'chat_name': 'K', 'text': 'b'}, Provenance.BACKFILL)
+    stats = store.journal_stats()
+    assert stats['by_provenance'][Provenance.REAL] == 1
+    assert stats['by_provenance'][Provenance.BACKFILL] == 1
+
+
+def test_journal_latency_percentiles(store):
+    jid = store.journal_event({'phone': PHONE, 'chat_id': CHANNEL, 'message_id': 5,
+                               'chat_name': 'K', 'text': 'a'})
+    assert store.mark_journal_processed(jid, 12.5) is True
+    latency = store.journal_stats()['latency_ms']
+    assert latency['count'] == 1 and latency['p50'] == 12.5
+
+
+def test_percentiles_helper():
+    from pinlives_pro.core.persistence import _percentiles
+    assert _percentiles([])['count'] == 0
+    p = _percentiles([float(i) for i in range(1, 101)])
+    assert p['p50'] == 50.0 and p['p95'] == 95.0 and p['max'] == 100.0
+
+
+def test_site_routing_dearmours_codes():
+    """Armoured codes are the real shape; a generic filter cannot recover them."""
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert extract_codes_for_text('MB66 code: aB★7x9◆Qm✦K', 'mb66') == ['aB7x9QmK']
+
+
+def test_site_routing_falls_back_without_site():
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert extract_codes_for_text('Code AB7X9Q2M', '') == ['AB7X9Q2M']
+
+
+def test_site_routing_survives_unknown_site():
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert isinstance(extract_codes_for_text('Code AB7X9Q2M', 'no_such_site'), list)

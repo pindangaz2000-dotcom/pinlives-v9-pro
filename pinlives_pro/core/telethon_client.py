@@ -457,3 +457,32 @@ class TelethonService:
                     'is_channel': dialog.is_channel,
                 })
         return out
+
+    async def fetch_history(self, chat_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+        """Recent posts from a channel, shaped like live events.
+
+        Used to seed the journal so a fresh install has real traffic to measure
+        against rather than waiting for the next post.
+        """
+        if not self.client or not self.authenticated:
+            raise TelethonError("Not authenticated.")
+        if chat_id not in self.allowed_channels:
+            raise TelethonError(f"Channel {chat_id} is not configured.")
+
+        out: List[Dict[str, Any]] = []
+        try:
+            async for message in self.client.iter_messages(chat_id, limit=limit):
+                if self.bot_user_id and getattr(message, 'sender_id', None) == self.bot_user_id:
+                    continue
+                out.append({
+                    'phone': self.phone,
+                    'chat_id': chat_id,
+                    'chat_name': f"Chat_{chat_id}",
+                    'message_id': message.id,
+                    'text': message.text or '',
+                    'date': message.date.isoformat() if message.date else None,
+                    'has_media': bool(message.media),
+                })
+        except Exception as e:
+            raise TelethonError(f"Could not read history for {chat_id}: {type(e).__name__}: {e}")
+        return out
