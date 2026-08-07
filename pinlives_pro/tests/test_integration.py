@@ -634,3 +634,74 @@ def test_preprocess_returns_binary_image():
     out = preprocess_screenshot(img, scale=2)
     assert out.shape[:2] == (40, 40)
     assert set(np.unique(out)) <= {0, 255}
+
+
+# ----------------------------------------------------------------------
+# OCR review queue: OCR codes are held for review, never confirmed
+# ----------------------------------------------------------------------
+
+def test_ocr_codes_go_to_review_not_confirmed(authed_store):
+    """A one-glyph-wrong OCR reading must not sit in the confirmed list."""
+    msg = authed_store.save_message(PHONE, CHANNEL, 'K', 1, '', has_media=True)
+    authed_store.save_code(msg, 'AB7X9Q2M', entropy=3.0)                    # text: confirmed
+    authed_store.save_code(msg, 'yNbEBTeSNa', ocr_confidence=0.6, is_valid=False)  # OCR: review
+
+    confirmed = [c['code'] for c in authed_store.get_codes(valid_only=True)]
+    review = [c['code'] for c in authed_store.get_review_codes()]
+
+    assert 'AB7X9Q2M' in confirmed
+    assert 'yNbEBTeSNa' not in confirmed
+    assert 'yNbEBTeSNa' in review
+
+
+def test_review_codes_carry_the_review_flag(authed_store):
+    msg = authed_store.save_message(PHONE, CHANNEL, 'K', 1, '', has_media=True)
+    authed_store.save_code(msg, 'kbs7cox3AU', ocr_confidence=0.8, is_valid=False)
+    row = authed_store.get_review_codes()[0]
+    assert row['needs_review'] is True
+    assert row['confidence'] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_media_message_runs_ocr_and_holds_for_review(authed_store, monkeypatch):
+    """End to end: a media payload produces review codes, not confirmed ones."""
+    from pinlives_pro.api import backend as backend_module
+
+    backend_module.persistence = authed_store
+    authed_store.add_channel(PHONE, CHANNEL, 'K', site_id='')
+
+    async def fake_ocr(media_path, site_id):
+        return [('kbs7cox3AU', 0.9)]
+    monkeypatch.setattr(backend_module, 'extract_codes_from_media', fake_ocr)
+
+    await backend_module.process_message({
+        'phone': PHONE, 'chat_id': CHANNEL, 'chat_name': 'K', 'message_id': 5,
+        'text': '', 'has_media': True, 'media_path': '/tmp/x.jpg',
+    })
+
+    assert [c['code'] for c in authed_store.get_codes(valid_only=True)] == []
+    assert 'kbs7cox3AU' in [c['code'] for c in authed_store.get_review_codes()]
+    backend_module.persistence = None
+
+
+@pytest.mark.asyncio
+async def test_ocr_failure_does_not_lose_the_message(authed_store, monkeypatch):
+    """If OCR raises, the text codes and the message must still be stored."""
+    from pinlives_pro.api import backend as backend_module
+
+    backend_module.persistence = authed_store
+    authed_store.add_channel(PHONE, CHANNEL, 'K', site_id='')
+
+    async def boom(media_path, site_id):
+        raise RuntimeError("tesseract exploded")
+    monkeypatch.setattr(backend_module, 'extract_codes_from_media', boom)
+
+    await backend_module.process_message({
+        'phone': PHONE, 'chat_id': CHANNEL, 'chat_name': 'K', 'message_id': 6,
+        'text': 'Ma AB7X9Q2M', 'has_media': True, 'media_path': '/tmp/x.jpg',
+    })
+
+    # The message survived and its text code was still extracted.
+    assert authed_store.count_messages() == 1
+    assert 'AB7X9Q2M' in [c['code'] for c in authed_store.get_codes()]
+    backend_module.persistence = None

@@ -417,8 +417,14 @@ class PersistenceManager:
         entropy: Optional[float] = None,
         pattern_score: Optional[float] = None,
         ocr_confidence: Optional[float] = None,
+        is_valid: bool = True,
     ) -> bool:
-        """Store an extracted code. False when the code was already recorded."""
+        """Store an extracted code. False when the code was already recorded.
+
+        is_valid=False marks a code as needing review rather than confirmed —
+        used for OCR readings, which are one wrong glyph away from a wrong code
+        and must not be treated as certain.
+        """
         try:
             code_hash = hashlib.sha256(code.encode()).hexdigest()
             with self._session() as db:
@@ -426,12 +432,12 @@ class PersistenceManager:
                     message_id=message_id,
                     code=code,
                     code_hash=code_hash,
-                    is_valid=True,
+                    is_valid=is_valid,
                     entropy=entropy,
                     pattern_score=pattern_score,
                     ocr_confidence=ocr_confidence,
                 ))
-            logger.info("Code saved: %s", code[:20])
+            logger.info("Code saved: %s (valid=%s)", code[:20], is_valid)
             return True
         except IntegrityError:
             logger.warning("Code already recorded: %s", code)
@@ -453,6 +459,7 @@ class PersistenceManager:
                         'entropy': r.entropy,
                         'pattern_score': r.pattern_score,
                         'confidence': r.ocr_confidence,
+                        'needs_review': not r.is_valid,
                         'extracted_at': r.extracted_at.isoformat() if r.extracted_at else None,
                     }
                     for r in rows
@@ -460,6 +467,10 @@ class PersistenceManager:
         except SQLAlchemyError as e:
             logger.error("Error listing codes: %s: %s", type(e).__name__, e)
             return []
+
+    def get_review_codes(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Codes awaiting human review — OCR readings, mostly."""
+        return self.get_codes(limit=limit, valid_only=False)
 
     def count_codes(self) -> int:
         try:

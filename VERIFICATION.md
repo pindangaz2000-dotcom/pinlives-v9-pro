@@ -228,3 +228,34 @@ health and status reporting, bot structure and rendering, login failure paths.
 
 Requires a live Telegram connection to confirm: sign-in, message capture from a
 real channel, 2FA.
+
+---
+
+## Update: OCR wired into the pipeline (review queue)
+
+OCR now runs on media messages inside the processing pipeline. Verified and not:
+
+**Verified**
+- Media messages run OCR in a thread pool, so a slow read does not block the
+  event loop.
+- OCR codes are stored as needs-review (`is_valid=False`), never confirmed.
+  They appear at `/api/codes/review`, not `/api/codes`. A text code and an OCR
+  code on the same message land in different lists — tested.
+- OCR failure (or timeout) does not lose the message: the text codes and the
+  message row are still stored, and the failure is logged — tested by raising
+  inside the OCR call and asserting the message survived.
+- Preprocessing, measured earlier: colour-key and the ported v9.5 preprocessor
+  both read 9 of 10 characters on a real banner crop.
+
+**Not verified in this environment**
+- Real OCR through the queue on a real image. Tesseract on this sandbox takes
+  >60s per variant on a 420x110 crop (a healthy host is well under a second),
+  so every variant hits the per-variant timeout and OCR yields nothing here.
+  This is an environment limit, not a code defect — the graceful-degradation
+  path (message saved, timeout logged) is what runs, and that is tested.
+- OCR accuracy end to end. The one remaining character error (`7` read as `T`)
+  is a recognition-model limit, unchanged by preprocessing. Recovering it needs
+  a stronger model than tesseract; that is why OCR codes are review-only.
+
+The `OCR_ENABLED` flag turns the media path off entirely, and
+`OCR_VARIANT_TIMEOUT_S` bounds each variant.

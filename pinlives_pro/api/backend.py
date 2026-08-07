@@ -24,6 +24,7 @@ from functools import wraps
 from ..models.database import init_db, Provenance
 from ..core.persistence import get_persistence
 from ..core.codefilter import extract_codes, shannon_entropy
+from concurrent.futures import ThreadPoolExecutor as _TPE
 from ..core.filters import extract_codes_for_site
 from ..core.config import get_settings
 from ..core.logging_setup import setup_logging
@@ -207,6 +208,9 @@ SCHEMA_VERSION = 2
 BUILD = None
 
 # Global instances
+# A small pool: OCR is CPU-bound, and more threads than cores only thrash.
+_ocr_pool = _TPE(max_workers=2)
+OCR_ENABLED = os.environ.get('OCR_ENABLED', 'true').lower() == 'true'
 ocr_cache = OCRCache()
 message_queue = MessageQueue()
 system_monitor = SystemMonitor()
@@ -408,9 +412,63 @@ async def process_message(payload: Dict) -> None:
     for code in found:
         persistence.save_code(msg_id, code, entropy=shannon_entropy(code))
 
+    # Codes in an image. OCR is one wrong glyph from a wrong code, so these are
+    # stored as needs-review (is_valid=False), never as confirmed alongside text
+    # codes. They surface at /api/codes/review, not /api/codes.
+    media_path = payload.get('media_path')
+    if media_path and OCR_ENABLED:
+        try:
+            ocr_codes = await extract_codes_from_media(media_path, site_id)
+            for code, confidence in ocr_codes:
+                persistence.save_code(
+                    msg_id, code, ocr_confidence=confidence, is_valid=False,
+                )
+            if ocr_codes:
+                logger.info("OCR queued %d code(s) for review from %s",
+                            len(ocr_codes), media_path)
+        except Exception as e:
+            # OCR failure must not lose the message; the text codes are stored.
+            logger.error("OCR failed for %s: %s: %s", media_path, type(e).__name__, e)
+
     elapsed_ms = (time.perf_counter() - started) * 1000
     if journal_id:
         persistence.mark_journal_processed(journal_id, elapsed_ms)
+
+
+async def extract_codes_from_media(media_path: str, site_id: Optional[str]) -> List[tuple]:
+    """OCR an image and return (code, confidence) pairs the site format accepts.
+
+    Runs in a thread: tesseract is blocking and would otherwise stall the queue.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_ocr_pool, _ocr_blocking, media_path, site_id)
+
+
+def _ocr_blocking(media_path: str, site_id: Optional[str]) -> List[tuple]:
+    from ..core.ocr import get_ocr, confusion_candidates
+
+    def accepts(token: str) -> bool:
+        # A candidate is a code only if the site's own filter would keep it.
+        if site_id:
+            return bool(extract_codes_for_text(token, site_id))
+        return bool(extract_codes(token))
+
+    ocr = get_ocr()
+    result = ocr.extract(media_path, validator=accepts)
+
+    out: List[tuple] = []
+    seen = set()
+    for candidate in result.codes:
+        if candidate.code not in seen:
+            seen.add(candidate.code)
+            out.append((candidate.code, candidate.confidence))
+        # A near-miss the site rejects can still be the true code with one
+        # confusable glyph swapped; offer those the site accepts, at lower rank.
+        for alt in confusion_candidates(candidate.code, max_swaps=1):
+            if alt not in seen and accepts(alt):
+                seen.add(alt)
+                out.append((alt, candidate.confidence * 0.75))
+    return out
 
     persistence.log_event(
         'INFO', 'backend', f"Message stored: {payload.get('chat_name')}",
@@ -624,9 +682,16 @@ async def list_channels(phone: str):
 
 @app.get("/api/codes")
 async def list_codes(limit: int = 50):
-    """Most recently extracted codes."""
+    """Confirmed codes (from text). OCR codes are not here — see /api/codes/review."""
     _require_ready()
     return {'success': True, 'codes': persistence.get_codes(limit=limit)}
+
+
+@app.get("/api/codes/review")
+async def list_review_codes(limit: int = 50):
+    """Codes awaiting review — OCR readings that may be one glyph wrong."""
+    _require_ready()
+    return {'success': True, 'codes': persistence.get_review_codes(limit=limit)}
 
 
 @app.get("/api/logs")

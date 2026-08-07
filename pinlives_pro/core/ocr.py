@@ -24,6 +24,7 @@ import re
 import time
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
@@ -47,6 +48,11 @@ _NON_ALNUM = re.compile(r'[^A-Za-z0-9]')
 MIN_CODE_LEN = 6
 MAX_CODE_LEN = 16
 MIN_WORD_CONF = 30.0
+
+# Per-variant deadline. A healthy tesseract reads a code crop in well under a
+# second; a slow host is a signal to surface, not to wait minutes on.
+import os as _os
+VARIANT_TIMEOUT_S = float(_os.environ.get('OCR_VARIANT_TIMEOUT_S', '15'))
 
 
 def _config(psm: int) -> str:
@@ -330,11 +336,17 @@ class GiftcodeOCR:
         sources: Dict[str, List[str]] = defaultdict(list)
         words_seen = 0
 
+        timed_out = 0
         for name, future in futures.items():
             try:
-                words = future.result(timeout=60)
+                words = future.result(timeout=VARIANT_TIMEOUT_S)
+            except FuturesTimeout:
+                timed_out += 1
+                logger.warning("OCR variant %s exceeded %.0fs — tesseract is slow "
+                               "on this host", name, VARIANT_TIMEOUT_S)
+                continue
             except Exception as e:
-                logger.warning("Variant %s failed: %s", name, e)
+                logger.warning("OCR variant %s failed: %s: %s", name, type(e).__name__, e)
                 continue
             words_seen += len(words)
             # One vote per variant per token: a variant repeating a token in the
@@ -362,6 +374,8 @@ class GiftcodeOCR:
         codes.sort(key=lambda c: (c.votes, c.confidence), reverse=True)
         codes = codes[:max_codes]
 
+        if timed_out:
+            logger.warning('OCR: %d/%d variants timed out', timed_out, len(variants))
         result = OCRResult(codes, (time.perf_counter() - start) * 1000, words_seen)
         self._store(key, result)
         return result
