@@ -83,6 +83,9 @@ class MonitoredChannel(Base):
     # Telegram channel IDs exceed 32-bit range (e.g. -1001234567890)
     channel_id = Column(BigInteger, nullable=False)
     channel_name = Column(String(255), nullable=False)
+    # Which site's code format this channel publishes. Selects the extractor:
+    # every site has its own shape, so the wrong one yields nothing or garbage.
+    site_id = Column(String(32), nullable=False, default='')
     added_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("TelegramSession", back_populates="channels")

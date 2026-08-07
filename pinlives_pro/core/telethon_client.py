@@ -82,6 +82,7 @@ class TelethonService:
         on_message: Optional[Callable[[Dict[str, Any]], Any]] = None,
         media_dir: str = "/tmp/telethon_media",
         otp_timeout_seconds: int = 600,
+        bot_user_id: Optional[int] = None,
     ):
         self.api_id = api_id
         self.api_hash = api_hash
@@ -89,6 +90,16 @@ class TelethonService:
         self.on_message = on_message
         self.media_dir = Path(media_dir)
         self.otp_timeout_seconds = otp_timeout_seconds
+
+        # Only these chats are listened to; everything else is discarded.
+        self.allowed_channels: set = set()
+        # Our own bot, so its reports are not re-ingested as new codes.
+        self.bot_user_id = bot_user_id
+        self.self_user_id: Optional[int] = None
+
+        self.ignored_unconfigured = 0
+        self.ignored_own_bot = 0
+        self.ignored_self = 0
 
         self.client: Optional[TelegramClient] = None
         self.phone: Optional[str] = None
@@ -136,6 +147,12 @@ class TelethonService:
             'messages_received': self.messages_received,
             'last_message': self.last_message_time.isoformat() if self.last_message_time else None,
             'otp_seconds_remaining': remaining,
+            'allowed_channels': sorted(self.allowed_channels),
+            'ignored': {
+                'unconfigured_chat': self.ignored_unconfigured,
+                'own_bot': self.ignored_own_bot,
+                'self': self.ignored_self,
+            },
         }
 
     # ------------------------------------------------------------------
@@ -162,6 +179,7 @@ class TelethonService:
             self.phone = phone
             self.state = LoginState.AUTHENTICATED
             self.user_display = getattr(me, 'first_name', None) or phone
+            self.self_user_id = getattr(me, 'id', None)
             await self._attach_listeners()
             self.persistence.mark_authenticated(phone)
             logger.info("Session restored for %s (%s)", phone, self.user_display)
@@ -268,6 +286,7 @@ class TelethonService:
 
         self.state = LoginState.AUTHENTICATED
         self.user_display = getattr(me, 'first_name', None) or self.phone
+        self.self_user_id = getattr(me, 'id', None)
         self._phone_code_hash = None
         self._code_requested_at = None
         await self._attach_listeners()
@@ -306,12 +325,55 @@ class TelethonService:
     # Listening
     # ------------------------------------------------------------------
 
+    def refresh_allowed_channels(self) -> int:
+        """Reload the monitored-channel allowlist from storage. Returns its size."""
+        if not self.phone:
+            self.allowed_channels = set()
+            return 0
+        try:
+            rows = self.persistence.get_channels(self.phone)
+        except Exception as e:
+            logger.error("Could not load the channel allowlist: %s: %s", type(e).__name__, e)
+            return len(self.allowed_channels)
+        self.allowed_channels = {r['channel_id'] for r in rows}
+        logger.info("Monitoring %d configured channel(s)", len(self.allowed_channels))
+        return len(self.allowed_channels)
+
+    def _should_handle(self, chat_id: Optional[int], sender_id: Optional[int]) -> bool:
+        """Whether a message belongs to the configured set.
+
+        Two rejections matter beyond the allowlist. Messages from our own bot
+        would feed its own reports back in as fresh codes, and messages the
+        account sent itself (Saved Messages) are not channel traffic.
+        """
+        if sender_id is not None:
+            if self.bot_user_id is not None and sender_id == self.bot_user_id:
+                self.ignored_own_bot += 1
+                return False
+            if self.self_user_id is not None and sender_id == self.self_user_id:
+                self.ignored_self += 1
+                return False
+
+        if chat_id is None or chat_id not in self.allowed_channels:
+            self.ignored_unconfigured += 1
+            return False
+        return True
+
     async def _attach_listeners(self):
-        """Subscribe to incoming messages exactly once per client."""
+        """Subscribe to messages from the configured channels only."""
         if self._listeners_ready or not self.client:
             return
 
-        @self.client.on(events.NewMessage(incoming=True))
+        self.refresh_allowed_channels()
+
+        # The predicate runs inside Telethon's dispatch, so traffic from every
+        # other chat is discarded on an O(1) set lookup before any work starts.
+        def _wanted(event) -> bool:
+            return self._should_handle(
+                getattr(event, 'chat_id', None), getattr(event, 'sender_id', None)
+            )
+
+        @self.client.on(events.NewMessage(incoming=True, func=_wanted))
         async def _handler(event):
             try:
                 await self._handle_message(event)
@@ -320,12 +382,24 @@ class TelethonService:
                 logger.error("Message handler failed: %s: %s", type(e).__name__, e)
 
         self._listeners_ready = True
-        logger.info("Listening for incoming messages")
+        logger.info("Listening on %d configured channel(s)", len(self.allowed_channels))
 
     async def _handle_message(self, event):
         message = event.message
+
+        # event.chat_id is the -100-prefixed form used everywhere else: what
+        # get_entity accepts, what dialogs report, what operators paste in.
+        # chat.id is the bare id and would never match a stored channel.
+        chat_id = getattr(event, 'chat_id', None)
+        sender_id = getattr(event, 'sender_id', None)
+
+        # Checked again here: the allowlist can change between dispatch and now,
+        # and this path is also reached from the backfill.
+        if not self._should_handle(chat_id, sender_id):
+            logger.debug("Ignoring message from chat %s", chat_id)
+            return
+
         chat = await event.get_chat()
-        chat_id = getattr(chat, 'id', None)
         chat_name = (
             getattr(chat, 'title', None)
             or getattr(chat, 'first_name', None)

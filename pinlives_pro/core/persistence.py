@@ -106,7 +106,8 @@ class PersistenceManager:
     # Channels
     # ------------------------------------------------------------------
 
-    def add_channel(self, phone: str, channel_id: int, channel_name: str) -> bool:
+    def add_channel(self, phone: str, channel_id: int, channel_name: str,
+                    site_id: str = '') -> bool:
         """Register a channel. False when the account is unknown or it already exists."""
         try:
             with self._session() as db:
@@ -126,6 +127,7 @@ class PersistenceManager:
                     session_id=session_row.id,
                     channel_id=channel_id,
                     channel_name=channel_name,
+                    site_id=(site_id or '').strip().lower(),
                 ))
             logger.info("Channel added: %s (%s)", channel_name, channel_id)
             return True
@@ -147,6 +149,7 @@ class PersistenceManager:
                     {
                         'channel_id': r.channel_id,
                         'channel_name': r.channel_name,
+                        'site_id': r.site_id or '',
                         'added_at': r.added_at.isoformat() if r.added_at else None,
                     }
                     for r in rows
@@ -154,6 +157,21 @@ class PersistenceManager:
         except SQLAlchemyError as e:
             logger.error("Error listing channels: %s: %s", type(e).__name__, e)
             return []
+
+    def get_channel_site(self, phone: str, channel_id: int) -> str:
+        """The site_id configured for a channel, or '' when it has none."""
+        try:
+            with self._session() as db:
+                session_row = db.query(TelegramSession).filter_by(phone=phone).first()
+                if session_row is None:
+                    return ''
+                row = db.query(MonitoredChannel).filter_by(
+                    session_id=session_row.id, channel_id=channel_id
+                ).first()
+                return (row.site_id or '') if row else ''
+        except SQLAlchemyError as e:
+            logger.error("Error reading channel site: %s: %s", type(e).__name__, e)
+            return ''
 
     # ------------------------------------------------------------------
     # Messages

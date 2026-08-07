@@ -402,3 +402,122 @@ async def test_endpoints_return_503_before_startup():
     async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
         resp = await client.get('/api/codes')
     assert resp.status_code == 503
+
+
+# ----------------------------------------------------------------------
+# Listener scope: only configured channels, never our own bot
+# ----------------------------------------------------------------------
+
+class _FakeChat:
+    def __init__(self, cid, title=None, first_name=None):
+        self.id, self.title, self.first_name = cid, title, first_name
+
+
+class _FakeMessage:
+    def __init__(self, mid, text):
+        from datetime import datetime as _dt
+        self.id, self.text, self.media = mid, text, None
+        self.date = _dt.now()
+
+
+class _FakeEvent:
+    def __init__(self, chat_id, message, sender_id=None):
+        self._chat = _FakeChat(chat_id, title=f'Chat{chat_id}')
+        self.message = message
+        self.chat_id = chat_id
+        self.sender_id = sender_id
+        self.out = False
+
+    async def get_chat(self):
+        return self._chat
+
+
+class _ChannelStub:
+    """Persistence stub exposing a single configured channel."""
+    def __init__(self, channel_id):
+        self.channel_id = channel_id
+
+    def get_channels(self, phone):
+        return [{'channel_id': self.channel_id, 'channel_name': 'Configured'}]
+
+
+def _service(configured, bot_user_id, self_user_id, sink):
+    from pinlives_pro.core.telethon_client import TelethonService
+    svc = TelethonService(api_id=1, api_hash='h', persistence=_ChannelStub(configured),
+                          on_message=sink, bot_user_id=bot_user_id)
+    svc.phone = PHONE
+    svc.self_user_id = self_user_id
+    svc.refresh_allowed_channels()
+    return svc
+
+
+BOT_ID = 8423073556
+SELF_ID = 7478077662
+
+
+@pytest.mark.asyncio
+async def test_listener_accepts_only_configured_channels():
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    svc = _service(CHANNEL, BOT_ID, SELF_ID, sink)
+    await svc._handle_message(_FakeEvent(CHANNEL, _FakeMessage(1, 'Ma: AB7X9Q2M')))
+    await svc._handle_message(_FakeEvent(-1009999999999, _FakeMessage(2, 'Ma: ZZ1Y8W3N')))
+
+    assert [p['chat_id'] for p in seen] == [CHANNEL]
+    assert svc.ignored_unconfigured == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_ignores_messages_from_our_own_bot():
+    """The bot reports codes to the admin; re-ingesting them is a feedback loop."""
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    svc = _service(CHANNEL, BOT_ID, SELF_ID, sink)
+    await svc._handle_message(
+        _FakeEvent(BOT_ID, _FakeMessage(3, 'Recent codes: AB7X9Q2M'), sender_id=BOT_ID)
+    )
+    assert seen == []
+    assert svc.ignored_own_bot == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_ignores_own_saved_messages():
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    svc = _service(CHANNEL, BOT_ID, SELF_ID, sink)
+    await svc._handle_message(
+        _FakeEvent(SELF_ID, _FakeMessage(4, 'note MM3K9Z2Q'), sender_id=SELF_ID)
+    )
+    assert seen == []
+    assert svc.ignored_self == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_uses_prefixed_chat_id():
+    """event.chat_id carries the -100 form; chat.id would never match storage."""
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    svc = _service(CHANNEL, BOT_ID, SELF_ID, sink)
+    event = _FakeEvent(CHANNEL, _FakeMessage(5, 'Ma: AB7X9Q2M'))
+    # chat.id deliberately differs from the -100-prefixed event.chat_id.
+    event._chat.id = 1234567890
+    await svc._handle_message(event)
+    assert seen and seen[0]['chat_id'] == CHANNEL
+
+
+def test_channel_site_id_round_trip(authed_store):
+    authed_store.add_channel(PHONE, CHANNEL, 'Kenh Kin', site_id='MB66')
+    assert authed_store.get_channel_site(PHONE, CHANNEL) == 'mb66'
+    assert authed_store.get_channels(PHONE)[0]['site_id'] == 'mb66'
