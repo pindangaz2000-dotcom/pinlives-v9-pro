@@ -237,6 +237,32 @@ def test_kjc_shared_does_not_change_normal_site_routing():
 
 
 # ----------------------------------------------------------------------
+# Per-site code-length rules
+# ----------------------------------------------------------------------
+
+def test_site_length_rule():
+    from pinlives_pro.core.site_rules import passes_length
+    # qq88 codes are exactly 10.
+    assert passes_length('qq88', 'cMoC1cCsy3') is True     # 10
+    assert passes_length('qq88', 'Please') is False        # 6
+    assert passes_length('qq88', 'cMoC1cCsy3X') is False   # 11
+    # KJC sites are exactly 6.
+    assert passes_length('mm88', 'J72LIS') is True         # 6
+    assert passes_length('mm88', 'J72LI') is False         # 5
+    # An unlisted site is unconstrained.
+    assert passes_length('hi88', 'uRCzuDA8Z7') is True
+    assert passes_length('', 'anything') is True
+
+
+def test_qq88_length_rule_drops_short_word_keeps_real_code():
+    """The vendored qq88 extractor accepts 'Please' (6 chars); the length rule
+    drops it while keeping the real 10-char code."""
+    from pinlives_pro.api.backend import extract_codes_for_text
+    assert extract_codes_for_text('Please open Telegram', 'qq88') == []
+    assert extract_codes_for_text('Ma moi: cMoC1cCsy3 Please', 'qq88') == ['cMoC1cCsy3']
+
+
+# ----------------------------------------------------------------------
 # Messages
 # ----------------------------------------------------------------------
 

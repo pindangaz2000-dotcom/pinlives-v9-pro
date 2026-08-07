@@ -27,6 +27,7 @@ from ..core.codefilter import extract_codes, shannon_entropy
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from ..core.filters import extract_codes_for_site
 from ..core.kjc_routing import resolve_sites
+from ..core.site_rules import passes_length
 from ..core.config import get_settings
 from ..core.logging_setup import setup_logging
 from ..core.telethon_client import TelethonService, TelethonError
@@ -594,6 +595,10 @@ def extract_codes_for_text(text: str, site_id: Optional[str]) -> List[str]:
             logger.error("Site extractor %s failed: %s: %s", site, type(e).__name__, e)
             continue
         for c in found:
+            # Enforce the site's known code length: the vendored extractor lets a
+            # short word through (qq88 'Please'), the length rule drops it.
+            if not passes_length(site, c):
+                continue
             if c not in seen:
                 seen.add(c)
                 out.append(c)
