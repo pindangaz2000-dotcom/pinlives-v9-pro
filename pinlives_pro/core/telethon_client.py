@@ -83,6 +83,7 @@ class TelethonService:
         media_dir: str = "/tmp/telethon_media",
         otp_timeout_seconds: int = 600,
         bot_user_id: Optional[int] = None,
+        sink_chat_ids: Optional[set] = None,
     ):
         self.api_id = api_id
         self.api_hash = api_hash
@@ -96,10 +97,17 @@ class TelethonService:
         # Our own bot, so its reports are not re-ingested as new codes.
         self.bot_user_id = bot_user_id
         self.self_user_id: Optional[int] = None
+        # Chats the system itself writes to (a detection-log / notification
+        # channel). A code the system announces there must never come back in as
+        # a fresh code — that is the feedback loop. These are rejected before the
+        # allowlist is even consulted, so a config mistake that lists a sink as a
+        # monitored channel still cannot start the loop.
+        self.sink_chat_ids: set = set(sink_chat_ids or [])
 
         self.ignored_unconfigured = 0
         self.ignored_own_bot = 0
         self.ignored_self = 0
+        self.ignored_sink = 0
 
         self.client: Optional[TelegramClient] = None
         self.phone: Optional[str] = None
@@ -148,10 +156,12 @@ class TelethonService:
             'last_message': self.last_message_time.isoformat() if self.last_message_time else None,
             'otp_seconds_remaining': remaining,
             'allowed_channels': sorted(self.allowed_channels),
+            'sink_chat_ids': sorted(self.sink_chat_ids),
             'ignored': {
                 'unconfigured_chat': self.ignored_unconfigured,
                 'own_bot': self.ignored_own_bot,
                 'self': self.ignored_self,
+                'sink': self.ignored_sink,
             },
         }
 
@@ -342,10 +352,22 @@ class TelethonService:
     def _should_handle(self, chat_id: Optional[int], sender_id: Optional[int]) -> bool:
         """Whether a message belongs to the configured set.
 
-        Two rejections matter beyond the allowlist. Messages from our own bot
-        would feed its own reports back in as fresh codes, and messages the
-        account sent itself (Saved Messages) are not channel traffic.
+        Rejections beyond the allowlist, each closing a feedback path:
+          * a message posted into one of our own sink chats (detection-log /
+            notification channel) — announcing a code must not re-detect it;
+          * a message sent by our own bot — its reports would feed back in as
+            fresh codes;
+          * a message the account sent itself (Saved Messages) — not channel
+            traffic.
+
+        The sink check comes first: it holds even if a sink is wrongly listed as
+        a monitored channel, and even if the message carries no sender_id (an
+        anonymous channel post).
         """
+        if chat_id is not None and chat_id in self.sink_chat_ids:
+            self.ignored_sink += 1
+            return False
+
         if sender_id is not None:
             if self.bot_user_id is not None and sender_id == self.bot_user_id:
                 self.ignored_own_bot += 1

@@ -271,7 +271,7 @@ def test_config_dict_excludes_secrets():
 @pytest.mark.asyncio
 async def test_message_endpoint_persists_and_extracts(authed_store):
     """Post a message to the running app and confirm it reaches the database."""
-    from httpx import AsyncClient
+    from httpx import AsyncClient, ASGITransport
     from pinlives_pro.api import backend as backend_module
 
     # Wire the module's globals the way startup() would, without opening a
@@ -281,7 +281,7 @@ async def test_message_endpoint_persists_and_extracts(authed_store):
     processor = asyncio.create_task(backend_module.message_processor())
 
     try:
-        async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+        async with AsyncClient(transport=ASGITransport(app=backend_module.app), base_url='http://test') as client:
             resp = await client.post('/api/telethon/message', json={
                 'phone': PHONE,
                 'chat_id': CHANNEL,
@@ -309,13 +309,13 @@ async def test_message_endpoint_persists_and_extracts(authed_store):
 @pytest.mark.asyncio
 async def test_message_without_phone_is_rejected(authed_store):
     """A payload missing 'phone' used to be accepted and then silently dropped."""
-    from httpx import AsyncClient
+    from httpx import AsyncClient, ASGITransport
     from pinlives_pro.api import backend as backend_module
 
     backend_module.persistence = authed_store
     backend_module.telethon_service = object()
     try:
-        async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+        async with AsyncClient(transport=ASGITransport(app=backend_module.app), base_url='http://test') as client:
             resp = await client.post('/api/telethon/message', json={
                 'chat_id': CHANNEL,
                 'chat_name': 'Kenh Kin',
@@ -394,12 +394,12 @@ async def test_failed_message_is_retried_then_dead_lettered(store, monkeypatch):
 @pytest.mark.asyncio
 async def test_endpoints_return_503_before_startup():
     """Requests that arrive before wiring completes must not raise AttributeError."""
-    from httpx import AsyncClient
+    from httpx import AsyncClient, ASGITransport
     from pinlives_pro.api import backend as backend_module
 
     backend_module.persistence = None
     backend_module.telethon_service = None
-    async with AsyncClient(app=backend_module.app, base_url='http://test') as client:
+    async with AsyncClient(transport=ASGITransport(app=backend_module.app), base_url='http://test') as client:
         resp = await client.get('/api/codes')
     assert resp.status_code == 503
 
@@ -441,10 +441,11 @@ class _ChannelStub:
         return [{'channel_id': self.channel_id, 'channel_name': 'Configured'}]
 
 
-def _service(configured, bot_user_id, self_user_id, sink):
+def _service(configured, bot_user_id, self_user_id, sink, sink_chat_ids=None):
     from pinlives_pro.core.telethon_client import TelethonService
     svc = TelethonService(api_id=1, api_hash='h', persistence=_ChannelStub(configured),
-                          on_message=sink, bot_user_id=bot_user_id)
+                          on_message=sink, bot_user_id=bot_user_id,
+                          sink_chat_ids=sink_chat_ids)
     svc.phone = PHONE
     svc.self_user_id = self_user_id
     svc.refresh_allowed_channels()
@@ -484,6 +485,54 @@ async def test_listener_ignores_messages_from_our_own_bot():
     )
     assert seen == []
     assert svc.ignored_own_bot == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_ignores_detection_log_channel():
+    """The detection-log sink must never be scanned, even if it were also listed
+    as a configured channel — that is the infinite re-detection loop."""
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    LOG_CHAN = -1005555555555
+    # Worst case: the sink is *also* in the monitored set (a config mistake).
+    svc = _service(LOG_CHAN, BOT_ID, SELF_ID, sink, sink_chat_ids={LOG_CHAN})
+    # A detection notice posted into the log channel, carrying a real-looking code.
+    await svc._handle_message(
+        _FakeEvent(LOG_CHAN, _FakeMessage(9, 'Detected code: AB7X9Q2M from Chat X'))
+    )
+    assert seen == []
+    assert svc.ignored_sink == 1
+
+
+@pytest.mark.asyncio
+async def test_listener_ignores_anonymous_bot_post_by_sink():
+    """A sink post with no sender_id (anonymous channel post) is still dropped:
+    the sink check runs before, and independently of, the sender checks."""
+    seen = []
+
+    async def sink(payload):
+        seen.append(payload)
+
+    LOG_CHAN = -1005555555555
+    svc = _service(CHANNEL, BOT_ID, SELF_ID, sink, sink_chat_ids={LOG_CHAN})
+    await svc._handle_message(
+        _FakeEvent(LOG_CHAN, _FakeMessage(10, 'code AB7X9Q2M'), sender_id=None)
+    )
+    assert seen == []
+    assert svc.ignored_sink == 1
+
+
+def test_bot_user_id_derived_from_token():
+    """backend derives the bot's user id from the token prefix so the own-bot
+    guard is actually armed (it was passed as None before)."""
+    from pinlives_pro.api.backend import _bot_user_id_from_token
+    assert _bot_user_id_from_token('8423073556:AAF-secret-part') == 8423073556
+    assert _bot_user_id_from_token('') is None
+    assert _bot_user_id_from_token('no-colon') is None
+    assert _bot_user_id_from_token('abc:def') is None
 
 
 @pytest.mark.asyncio

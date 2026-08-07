@@ -82,6 +82,12 @@ class Settings:
         self.db_port = os.getenv('DB_PORT', '5432')
         self.db_name = os.getenv('DB_NAME', 'pinlives_pro')
 
+        # --- Optional: Detection-log / notification sink ---
+        # A chat the system posts its own "detected code" notices to. It is
+        # excluded from scanning so an announced code never re-enters as a fresh
+        # one (the feedback loop). Unset means no such channel is used.
+        self.notify_chat_id = self._optional_int_or_none('NOTIFY_CHAT_ID')
+
         # --- Optional: Session handling ---
         self.session_dir = os.getenv('SESSION_DIR', '/tmp/telethon_sessions')
         self.otp_timeout_seconds = self._optional_int('OTP_TIMEOUT_SECONDS', 600)
@@ -106,6 +112,16 @@ class Settings:
         raw = os.getenv(key)
         if raw is None or raw == '':
             return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise ConfigError(f"{key} must be an integer, got: {raw!r}")
+
+    @staticmethod
+    def _optional_int_or_none(key: str) -> Optional[int]:
+        raw = os.getenv(key)
+        if raw is None or raw == '':
+            return None
         try:
             return int(raw)
         except ValueError:

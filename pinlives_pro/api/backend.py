@@ -204,6 +204,14 @@ def _build_identity() -> Dict[str, Any]:
     }
 
 
+def _bot_user_id_from_token(token: Optional[str]) -> Optional[int]:
+    """The bot's user id is the numeric part of "<id>:<secret>". None if malformed."""
+    if not token or ':' not in token:
+        return None
+    head = token.split(':', 1)[0]
+    return int(head) if head.isdigit() else None
+
+
 SCHEMA_VERSION = 2
 BUILD = None
 
@@ -319,12 +327,19 @@ async def startup():
 
     # The Telethon client runs in this process so the login endpoints can drive it.
     settings = get_settings()
+    # A bot token is "<bot_user_id>:<secret>"; the numeric prefix is the bot's
+    # own Telegram user id. Passing it arms the guard that drops the bot's own
+    # posts, so a detection notice the bot emits is never re-ingested as a code.
+    bot_user_id = _bot_user_id_from_token(settings.bot_token)
+    sink_chat_ids = {settings.notify_chat_id} if settings.notify_chat_id else set()
     telethon_service = TelethonService(
         api_id=settings.telethon_api_id,
         api_hash=settings.telethon_api_hash,
         persistence=persistence,
         on_message=_enqueue_from_telethon,
         otp_timeout_seconds=settings.otp_timeout_seconds,
+        bot_user_id=bot_user_id,
+        sink_chat_ids=sink_chat_ids,
     )
 
     # Reconnect without operator involvement when a session survives a restart.
