@@ -263,6 +263,43 @@ def test_qq88_length_rule_drops_short_word_keeps_real_code():
 
 
 # ----------------------------------------------------------------------
+# Image-only sites (8KBET)
+# ----------------------------------------------------------------------
+
+def test_is_image_only():
+    from pinlives_pro.core.site_rules import is_image_only
+    assert is_image_only('8kbet') is True
+    assert is_image_only('8KBET') is True
+    assert is_image_only('hi88') is False
+    assert is_image_only('') is False
+
+
+@pytest.mark.asyncio
+async def test_image_only_site_skips_text_codes(authed_store):
+    """8KBET posts its codes only in images, so a code-shaped token in the
+    promo text must not be stored; the same token on a normal site is."""
+    from pinlives_pro.api import backend as backend_module
+    backend_module.persistence = authed_store
+    try:
+        await backend_module.process_message({
+            'phone': PHONE, 'chat_id': CHANNEL, 'chat_name': '8kbet',
+            'message_id': 5001, 'site_id': '8kbet', 'has_media': False,
+            'text': 'Nhan code Zx9K2mQ7 tai t.me/CODESHARE8KBET_BOT',
+        })
+        assert authed_store.get_codes() == []
+
+        # Control: the same token on a generic site is extracted and stored.
+        await backend_module.process_message({
+            'phone': PHONE, 'chat_id': -1009999999999, 'chat_name': 'x',
+            'message_id': 5002, 'site_id': '', 'has_media': False,
+            'text': 'Ma hom nay: Zx9K2mQ7',
+        })
+        assert [c['code'] for c in authed_store.get_codes()] == ['Zx9K2mQ7']
+    finally:
+        backend_module.persistence = None
+
+
+# ----------------------------------------------------------------------
 # Messages
 # ----------------------------------------------------------------------
 

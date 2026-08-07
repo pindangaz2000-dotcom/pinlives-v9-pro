@@ -26,3 +26,15 @@ def passes_length(site: Optional[str], code: str) -> bool:
     if not rng:
         return True
     return rng[0] <= len(code) <= rng[1]
+
+
+# Sites that publish their codes only inside images. Their message text is
+# promo copy (links, spoilers, amounts) with no code, so running the text
+# extractor on it only produces false positives — the code comes from OCR of the
+# attached image instead. 8KBET posts its codes 100% on images.
+IMAGE_ONLY_SITES = {'8kbet'}
+
+
+def is_image_only(site: Optional[str]) -> bool:
+    """True if the site's codes live only in images, so message text is skipped."""
+    return (site or '').strip().lower() in IMAGE_ONLY_SITES

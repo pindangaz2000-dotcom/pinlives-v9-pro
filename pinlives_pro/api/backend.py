@@ -27,7 +27,7 @@ from ..core.codefilter import extract_codes, shannon_entropy
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from ..core.filters import extract_codes_for_site
 from ..core.kjc_routing import resolve_sites
-from ..core.site_rules import passes_length
+from ..core.site_rules import passes_length, is_image_only
 from ..core.config import get_settings
 from ..core.logging_setup import setup_logging
 from ..core.telethon_client import TelethonService, TelethonError
@@ -482,9 +482,12 @@ async def process_message(payload: Dict) -> None:
             f"save_message returned no row id for phone={phone} chat={payload.get('chat_id')}"
         )
 
+    # Image-only sites (8KBET) carry the code in the picture, never the text, so
+    # the text is skipped to avoid extracting promo links/spoilers as codes; the
+    # OCR pass below is the code source for these.
     text = payload.get('text') or ''
     t_extract = time.perf_counter()
-    found = extract_codes_for_text(text, site_id)
+    found = [] if is_image_only(site_id) else extract_codes_for_text(text, site_id)
     stage_stats.record('extract', (time.perf_counter() - t_extract) * 1000)
 
     # One bulk insert for the message's text codes, not a commit per code.
