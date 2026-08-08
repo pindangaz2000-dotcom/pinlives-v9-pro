@@ -341,6 +341,23 @@ def test_image_only_regions_shapes():
     assert len(GiftcodeOCR._image_only_regions(np.zeros((50, 150, 3), np.uint8))) == 1
 
 
+def test_image_only_readers_fallback_and_cache():
+    """The image-only ensemble builds once and always includes the primary
+    reader; with no rapid backend it falls back to None."""
+    from pinlives_pro.core.ocr import GiftcodeOCR
+    ocr = GiftcodeOCR.__new__(GiftcodeOCR)   # bypass model loading
+    ocr._rapid = None
+    ocr._io_readers = None
+    assert ocr._image_only_readers() is None
+    # With a primary reader present, the set includes it and is cached. The
+    # second (v5) model may or may not build here; either way the call succeeds.
+    ocr._rapid = ['primary']
+    ocr._io_readers = None
+    first = ocr._image_only_readers()
+    assert first[0] == 'primary'
+    assert ocr._image_only_readers() is first   # built once, cached
+
+
 # ----------------------------------------------------------------------
 # Messages
 # ----------------------------------------------------------------------

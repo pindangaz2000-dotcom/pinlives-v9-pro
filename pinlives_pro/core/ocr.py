@@ -386,6 +386,7 @@ class GiftcodeOCR:
         self._cache_size = cache_size
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._rapid = _load_rapidocr()
+        self._io_readers = None  # lazy v4+v5 ensemble for image-only sites
 
     @property
     def backend(self) -> str:
@@ -404,16 +405,18 @@ class GiftcodeOCR:
         s = OCR_MAX_SIDE / longest
         return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
 
-    def _rapid_words(self, img: np.ndarray) -> List[Tuple[str, float]]:
+    def _rapid_words(self, img: np.ndarray, readers=None) -> List[Tuple[str, float]]:
         """(token, confidence 0-100) for every alnum word PP-OCRv4 detects.
 
         Detection sometimes merges an adjacent balance/label into a code
         (`10092JtVzWvYrF`), so substrings of a long token are offered too — the
         site validator picks the real code out of them.
+
+        readers overrides the reader set (used by the image-only ensemble).
         """
         img = self._cap_resolution(img)
         pairs: List[Tuple[str, float]] = []
-        for reader in self._rapid:
+        for reader in (readers or self._rapid):
             try:
                 pairs.extend(_normalise_result(reader(img)))
             except Exception as e:
@@ -484,6 +487,23 @@ class GiftcodeOCR:
         cols = np.hstack([gray3[:, :int(w * 0.30)], gray3[:, int(w * 0.70):]])
         return [gray3, cols]
 
+    def _image_only_readers(self):
+        """The reader set for image-only OCR: the primary plus the other PP-OCR
+        version, built once. The two versions disagree on different confusable
+        glyphs, so unioning their reads recovers codes neither gets alone. Falls
+        back to the primary reader(s) if the second model cannot be built."""
+        if not self._rapid:
+            return self._rapid
+        if self._io_readers is None:
+            readers = list(self._rapid)
+            other = 'PP-OCRv5' if OCR_MODEL_VERSION != 'PP-OCRv5' else 'PP-OCRv4'
+            try:
+                readers.append(_build_rapid(other, OCR_REC_LANG))
+            except Exception as e:
+                logger.warning("Image-only ensemble second model unavailable: %s", e)
+            self._io_readers = readers
+        return self._io_readers
+
     def _extract_rapid(self, img, validator, max_codes, start,
                        image_only: bool = False) -> 'OCRResult':
         """Read with PP-OCRv4, then rank by confidence and validate.
@@ -496,9 +516,13 @@ class GiftcodeOCR:
         words, for sites whose codes sit in side columns around a photo.
         """
         if image_only:
+            # Different model versions make different single-glyph confusions, so
+            # a v4+v5 ensemble over the two regions recovers codes neither reads
+            # alone (measured 16 -> 17 of 20 on a real 8KBET image).
+            readers = self._image_only_readers()
             words: List[Tuple[str, float]] = []
             for region in self._image_only_regions(img):
-                words.extend(self._rapid_words(region))
+                words.extend(self._rapid_words(region, readers=readers))
         else:
             words = self._rapid_words(img)
         best_conf: Dict[str, float] = {}
