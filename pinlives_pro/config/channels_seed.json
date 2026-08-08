@@ -1,0 +1,49 @@
+{
+  "_comment": "Monitored channels ported from the v9.5 telegram_listener_daemon CHANNELS_CONFIG. Each entry maps a Telegram channel to the site whose code format its posts carry. Usernames are resolved to channel ids at seed time (Telegram must be reachable); entries that already carry a numeric channel_id are added directly. site 'kjc_shared' marks an aggregate channel that posts codes for several KJC sites; the extractor falls back to the generic filter for those until per-message site routing is added.",
+  "channels": [
+    {"username": "qq88reviewphim", "site": "qq88"},
+    {"username": "qq88tinhot247", "site": "qq88"},
+    {"username": "codemienphiqq88", "site": "qq88"},
+    {"username": "qq88khogif", "site": "qq88"},
+    {"username": "qq88giaitrimoingay", "site": "qq88"},
+    {"username": "qq88tintucmoingay", "site": "qq88"},
+    {"username": "trochuyenqq88", "site": "qq88"},
+    {"channel_id": -1002272716520, "name": "qq88 (private)", "site": "qq88"},
+
+    {"username": "hi88code", "site": "hi88"},
+    {"username": "hi88tinhotmoingay", "site": "hi88"},
+    {"username": "hi88reviewphimhay", "site": "hi88"},
+    {"username": "hi88kenhgiaitrihot", "site": "hi88"},
+    {"username": "hi88khogif", "site": "hi88"},
+
+    {"username": "llwindichvugiainhan", "site": "llwin"},
+    {"username": "llwinshowbiz", "site": "llwin"},
+    {"username": "llwingiaitri24h", "site": "llwin"},
+
+    {"username": "mm88gai18", "site": "mm88"},
+    {"username": "girlxinhcodexin", "site": "mm88"},
+
+    {"username": "rr88dichvugiainhan", "site": "rr88"},
+    {"username": "rr88donggai", "site": "rr88"},
+
+    {"username": "xx88dichvugiainhan", "site": "xx88"},
+    {"username": "xx88esport", "site": "xx88"},
+
+    {"username": "gg88dichvugiainhan", "site": "gg88"},
+    {"username": "dongdamtonghop", "site": "gg88"},
+
+    {"username": "codemb66live", "site": "mb66"},
+    {"username": "mb66code", "site": "mb66"},
+
+    {"username": "c168phatcode", "site": "c168"},
+
+    {"username": "sc88phatcode", "site": "sc88"},
+
+    {"username": "vn8kbet", "site": "8kbet"},
+
+    {"username": "kjc_gaixinh2", "site": "kjc_shared"},
+    {"username": "kjc_thethao", "site": "kjc_shared"},
+    {"username": "kjc_fifa_worldcup", "site": "kjc_shared"},
+    {"username": "stthaymoingay", "site": "kjc_shared"}
+  ]
+}

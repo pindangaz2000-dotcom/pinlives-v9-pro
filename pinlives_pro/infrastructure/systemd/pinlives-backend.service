@@ -1,0 +1,23 @@
+[Unit]
+Description=PINLIVES Pro Backend API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+# uvicorn does not implement sd_notify, so notify would make systemd wait for a
+# readiness signal that never arrives and time the unit out. simple is correct.
+Type=simple
+User=pinlives
+WorkingDirectory=/opt/pinlives
+Environment="PATH=/opt/pinlives/venv/bin"
+EnvironmentFile=/opt/pinlives/.env
+ExecStart=/opt/pinlives/venv/bin/python -m uvicorn pinlives_pro.api.backend:app --host 0.0.0.0 --port 8000
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=process
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

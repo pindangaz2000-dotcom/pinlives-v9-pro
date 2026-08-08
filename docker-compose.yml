@@ -1,0 +1,70 @@
+services:
+  # Backend: FastAPI + the Telethon client, in one process.
+  # They share an event loop, which is what lets the login endpoints actually
+  # drive Telegram instead of reporting success without contacting it.
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pinlives-backend
+    command: >
+      python -m uvicorn pinlives_pro.api.backend:app
+      --host 0.0.0.0 --port 8000
+    environment:
+      TELETHON_API_ID: ${TELETHON_API_ID:?set TELETHON_API_ID in .env}
+      TELETHON_API_HASH: ${TELETHON_API_HASH:?set TELETHON_API_HASH in .env}
+      TELETHON_PHONE: ${TELETHON_PHONE:?set TELETHON_PHONE in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ADMIN_ID: ${TELEGRAM_ADMIN_ID:?set TELEGRAM_ADMIN_ID in .env}
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_PATH: /data/pinlives_pro.db
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /var/log/pinlives/backend.log
+    volumes:
+      - pinlives_data:/data
+      - ./logs:/var/log/pinlives
+      - pinlives_media:/tmp/telethon_media
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - pinlives
+
+  # Bot: the operator console. Holds no state; it only calls the backend.
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pinlives-bot
+    command: python -m pinlives_pro.bot.orchestrator
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      TELETHON_API_ID: ${TELETHON_API_ID:?set TELETHON_API_ID in .env}
+      TELETHON_API_HASH: ${TELETHON_API_HASH:?set TELETHON_API_HASH in .env}
+      TELETHON_PHONE: ${TELETHON_PHONE:?set TELETHON_PHONE in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ADMIN_ID: ${TELEGRAM_ADMIN_ID:?set TELEGRAM_ADMIN_ID in .env}
+      BACKEND_URL: http://backend:8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FILE: /var/log/pinlives/bot.log
+    volumes:
+      - ./logs:/var/log/pinlives
+    restart: unless-stopped
+    networks:
+      - pinlives
+
+volumes:
+  pinlives_data:
+  pinlives_media:
+
+networks:
+  pinlives:
+    driver: bridge

@@ -1,0 +1,36 @@
+name: CI
+
+# Runs the integration suite, a syntax/compile check, and pyflakes on every push
+# and pull request, so a regression is caught before it reaches a running deploy.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyflakes
+
+      - name: Lint (pyflakes) — excludes the vendored filters.py
+        run: |
+          find pinlives_pro -name '*.py' ! -name 'filters.py' -print0 \
+            | xargs -0 python -m pyflakes
+
+      - name: Compile all modules
+        run: python -m compileall -q pinlives_pro
+
+      - name: Run tests
+        run: python -m pytest pinlives_pro/tests -q
