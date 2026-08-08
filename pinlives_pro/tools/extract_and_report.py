@@ -18,8 +18,7 @@ Usage:
 import argparse
 import asyncio
 import sys
-from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from ..core.config import load_settings_or_exit
 from ..core.filters import extract_codes_for_site

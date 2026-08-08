@@ -23,7 +23,7 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from ..core.config import load_settings_or_exit
 from ..core.logging_setup import setup_logging
@@ -98,7 +98,6 @@ async def seed(offline: bool, dry_run: bool) -> Dict[str, int]:
                     tally['skipped_offline'] += 1
                     continue
                 try:
-                    from telethon.utils import get_peer_id
                     entity = await client.get_entity(ch["username"])
                     channel_id = get_peer_id(entity)
                     name = getattr(entity, 'title', None) or name

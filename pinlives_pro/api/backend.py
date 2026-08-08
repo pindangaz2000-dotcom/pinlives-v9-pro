@@ -3,23 +3,19 @@ PINLIVES Pro v3.1 - FastAPI Backend
 Production-grade with persistence, monitoring, security, and error handling
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, Dict, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import os
 import re
 import time
-import json
 import psutil
-import hashlib
 from collections import OrderedDict, deque, defaultdict
 from pathlib import Path
 import asyncio
-import aiohttp
-from functools import wraps
 
 from ..models.database import init_db, Provenance
 from ..core.persistence import get_persistence
@@ -573,17 +569,6 @@ def _ocr_blocking(media_path: str, site_id: Optional[str]) -> List[tuple]:
                 seen.add(alt)
                 out.append((alt, candidate.confidence * 0.75))
     return out
-
-    persistence.log_event(
-        'INFO', 'backend', f"Message stored: {payload.get('chat_name')}",
-        {
-            'chat_id': payload.get('chat_id'),
-            'message_id': payload.get('message_id'),
-            'site_id': site_id,
-            'codes': len(found),
-            'ms': round(elapsed_ms, 1),
-        },
-    )
 
 
 def extract_codes_for_text(text: str, site_id: Optional[str]) -> List[str]:

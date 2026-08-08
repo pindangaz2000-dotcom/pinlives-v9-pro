@@ -11,7 +11,6 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
-from typing import Optional
 import os
 from pathlib import Path
 

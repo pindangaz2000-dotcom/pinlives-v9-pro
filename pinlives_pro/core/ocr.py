@@ -144,18 +144,21 @@ def preprocess_screenshot(
 # tesseract gives no signal that it was uncertain, so candidates are generated
 # and the site validator decides. This cannot rescue a code whose alternatives
 # are all valid for the site; it recovers the ones where the format disagrees.
+# Each glyph maps to a string of glyphs it is confused with (several are
+# possible, so a value is not a single char): 1/l/I are a mutually-confusable
+# cluster, and I also reads as H. A flat one-target map silently dropped
+# 'I'->'1' when 'I'->'H' was added later; the string values keep both.
 CONFUSIONS = {
     '7': 'T', 'T': '7',
     '0': 'O', 'O': '0',
-    '1': 'l', 'l': '1', 'I': '1',
+    '1': 'lI', 'l': '1I', 'I': '1lH', 'H': 'I',
     '5': 'S', 'S': '5',
     '8': 'B', 'B': '8',
     '2': 'Z', 'Z': '2',
     '6': 'G', 'G': '6',
     '9': 'g', 'g': '9',
     # Observed in the PP-OCRv4 benchmark on real posts:
-    'H': 'I', 'I': 'H',   # rS2HNFvDME read as rS2INFvDME
-    'c': 'e', 'e': 'c',   # kbs7cox3AU read as kbs7e0x3AU
+    'c': 'e', 'e': 'c',   # kbs7cox3AU read as kbs7eox3AU
     'k': 'h', 'h': 'k',   # E8kkYruH8t read as C8hhYruH8t
     'E': 'C', 'C': 'E',
 }
@@ -205,15 +208,16 @@ def confusion_candidates(code: str, max_swaps: int = MAX_CONFUSION_SWAPS) -> Lis
         nxt = []
         for candidate in frontier:
             for i, ch in enumerate(candidate):
-                for swap in (CONFUSIONS.get(ch), CASE_PAIRS.get(ch)):
-                    if not swap:
-                        continue
-                    alt = candidate[:i] + swap + candidate[i + 1:]
-                    if alt in seen:
-                        continue
-                    seen.add(alt)
-                    results.append(alt)
-                    nxt.append(alt)
+                # Each source may offer several target glyphs (a string); the
+                # case pair is a single char, which iterates as one.
+                for swap_src in (CONFUSIONS.get(ch, ''), CASE_PAIRS.get(ch, '')):
+                    for swap in swap_src:
+                        alt = candidate[:i] + swap + candidate[i + 1:]
+                        if alt in seen:
+                            continue
+                        seen.add(alt)
+                        results.append(alt)
+                        nxt.append(alt)
         frontier = nxt
         if not frontier:
             break

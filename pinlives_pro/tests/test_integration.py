@@ -877,6 +877,16 @@ def test_confusion_candidates_reach_the_true_reading():
     assert 'yNbEB7eSNa' in confusion_candidates('yNbEBTeSNa', max_swaps=1)
 
 
+def test_confusion_i_maps_to_all_of_its_glyphs():
+    """'I' is confusable with 1, l and H at once; a flat map used to drop all but
+    the last. All three must be offered, and a real 2-glyph case must resolve."""
+    from pinlives_pro.core.ocr import confusion_candidates
+    one = confusion_candidates('I', max_swaps=1)
+    assert {'1', 'l', 'H'} <= set(one)
+    # rS2HNFvDME was read as rS2INFvDME (I<-H) — reachable now that I->H survives.
+    assert 'rS2HNFvDME' in confusion_candidates('rS2INFvDME', max_swaps=2)
+
+
 def test_confusion_candidates_exclude_the_input():
     from pinlives_pro.core.ocr import confusion_candidates
     assert 'yNbEBTeSNa' not in confusion_candidates('yNbEBTeSNa', max_swaps=1)
