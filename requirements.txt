@@ -19,6 +19,13 @@ aiohttp==3.14.3
 python-dotenv==1.2.2
 psutil==7.2.2
 
+# Image handling — imported at module load in core/ocr.py, so required even
+# before any OCR runs (a bare install without these fails to import the backend).
+numpy==2.4.6
+opencv-python-headless==5.0.0.93
+Pillow==12.3.0
+pytesseract==0.3.13            # tesseract fallback (needs the tesseract binary)
+
 # OCR: PP-OCRv4 recognition + detection via onnxruntime (primary OCR backend).
 # Tesseract stays as the fallback when this is absent.
 rapidocr==3.9.2

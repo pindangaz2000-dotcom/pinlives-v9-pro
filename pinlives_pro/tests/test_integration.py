@@ -8,7 +8,6 @@ mocked away, so a passing run means the code paths actually executed.
 
 import asyncio
 import os
-import sys
 from pathlib import Path
 
 import pytest

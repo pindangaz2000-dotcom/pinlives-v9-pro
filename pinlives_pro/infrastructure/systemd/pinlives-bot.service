@@ -1,0 +1,21 @@
+[Unit]
+Description=PINLIVES Pro Telegram Bot (operator control panel)
+# The bot talks to the backend's HTTP API on localhost, so start it after.
+After=network.target pinlives-backend.service
+Wants=pinlives-backend.service
+
+[Service]
+Type=simple
+User=pinlives
+WorkingDirectory=/opt/pinlives
+Environment="PATH=/opt/pinlives/venv/bin"
+EnvironmentFile=/opt/pinlives/.env
+ExecStart=/opt/pinlives/venv/bin/python -m pinlives_pro.bot.orchestrator
+KillMode=process
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

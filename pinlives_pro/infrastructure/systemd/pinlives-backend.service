@@ -4,7 +4,9 @@ After=network.target postgresql.service
 Wants=postgresql.service
 
 [Service]
-Type=notify
+# uvicorn does not implement sd_notify, so notify would make systemd wait for a
+# readiness signal that never arrives and time the unit out. simple is correct.
+Type=simple
 User=pinlives
 WorkingDirectory=/opt/pinlives
 Environment="PATH=/opt/pinlives/venv/bin"
